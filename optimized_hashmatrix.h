@@ -11,16 +11,25 @@
 template <typename T>
 class optimized_hashmatrix {
 private:
+    // Block size for dense storage - each dense block is 64x64
     static constexpr size_t BLOCK_SIZE = 64;
+    // When a block becomes more than 50% full, it converts to dense storage
     static constexpr double DENSITY_THRESHOLD = 0.5;
 
-    // Shared sparse storage
+    /*
+     * Hybrid Storage Strategy:
+     * 1. Sparse regions use hash-based storage (sparseData)
+     * 2. Dense regions use 64x64 blocks (denseBlocks)
+     * The matrix automatically switches between these based on density
+     */
+    
+    // Stores sparse elements as (row,col) -> value mappings
     std::unordered_map<std::pair<int, int>, T, PairHash> sparseData;
 
-    // Dense block storage
+    // Dense block storage - used when a 64x64 region becomes >50% full
     struct DenseBlock {
         std::vector<std::vector<T>> data;
-        bool isDirty; // Track if block needs density recalculation
+        bool isDirty; // Tracks if block needs density recalculation
         
         DenseBlock() : isDirty(false) {
             data.resize(BLOCK_SIZE, std::vector<T>(BLOCK_SIZE, 0));
@@ -28,7 +37,7 @@ private:
     };
     std::unordered_map<std::pair<int, int>, DenseBlock, PairHash> denseBlocks;
 
-    // Density tracking
+    // Tracks number of non-zero elements in each block for density calculations
     std::unordered_map<std::pair<int, int>, size_t, PairHash> blockNonZeroCount;
     size_t numRows, numCols;
 
@@ -100,6 +109,14 @@ private:
     }
 
 public:
+    /*
+     * Matrix Operations:
+     * - insert(): Automatically handles sparse/dense conversion
+     * - get(): Checks dense blocks first (faster), then sparse storage
+     * - multiply(): Uses block-based multiplication for better cache utilization
+     * - add(): Processes dense blocks in parallel, then handles sparse elements
+     */
+
     optimized_hashmatrix(size_t rows, size_t cols) 
         : numRows(rows)
         , numCols(cols)
@@ -149,15 +166,22 @@ public:
         auto blockCoord = getBlockCoords(row, col);
         auto localCoord = getLocalCoords(row, col);
 
+        // First check dense blocks (faster path)
         auto blockIt = denseBlocks.find(blockCoord);
         if (blockIt != denseBlocks.end()) {
             return blockIt->second.data[localCoord.first][localCoord.second];
-        } else {
-            auto it = sparseData.find({row, col});
-            return it != sparseData.end() ? it->second : T{};
         }
+
+        // Then check sparse storage
+        auto it = sparseData.find({row, col});  // Using global coordinates
+        return it != sparseData.end() ? it->second : T{};
     }
 
+    /*
+     * Batch Operations:
+     * - batchInsert(): Optimizes multiple insertions by grouping them by block
+     * - This reduces the number of density recalculations and conversions
+     */
     void batchInsert(const std::vector<std::tuple<int, int, T>>& data) {
         // Group elements by block
         std::unordered_map<std::pair<int, int>, std::vector<std::tuple<int, int, T>>, PairHash> blockGroups;
@@ -195,6 +219,13 @@ public:
         }
     }
 
+    /*
+     * Matrix Multiplication:
+     * 1. Divides matrices into blocks for better cache usage
+     * 2. Uses OpenMP for parallel processing
+     * 3. Optimizes dense*dense multiplication
+     * 4. Has special handling for sparse blocks
+     */
     optimized_hashmatrix<T> multiply(const optimized_hashmatrix<T>& other) const {
         if (numCols != other.numRows) {
             throw std::invalid_argument("Matrix dimensions must match for multiplication");
@@ -303,7 +334,11 @@ public:
         return result;
     }
 
-    // Iterator support
+    /*
+     * Iterator Support:
+     * Provides efficient iteration over non-zero elements only
+     * Useful for sparse matrix algorithms and visualization
+     */
     class Iterator {
     private:
         const optimized_hashmatrix<T>* matrix;

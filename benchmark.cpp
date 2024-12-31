@@ -672,40 +672,62 @@ static void OptimizedHashMatrix_Multiply(benchmark::State& state) {
     }
 }
 
+static void OptimizedHashMatrix_Search(benchmark::State& state) {
+    const int size = state.range(0);
+    const double sparsity = 0.01;
+    auto testData = TestData::generate(size, sparsity);
+    
+    optimized_hashmatrix<double> matrix(size, size);
+    auto batchData = testData.generateBatchData(size, testData.sparseData.size());
+    matrix.batchInsert(batchData);
+    
+    for (auto _ : state) {
+        double sum = 0.0;
+        for (const auto& [i, j, _] : testData.queryData) {
+            double val = matrix.get(i, j);
+            if (val != 0.0) {
+                sum += val;
+            }
+        }
+        benchmark::DoNotOptimize(sum);
+    }
+}
+
 // Register all benchmarks consistently
-BENCHMARK(Matrix_Insert)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(Matrix_BatchInsert)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(Matrix_Access)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(Matrix_Update)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(Matrix_Delete)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(Matrix_Search)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(Matrix_Add)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(Matrix_Multiply)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(Matrix_Insert)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(Matrix_BatchInsert)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(Matrix_Access)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(Matrix_Update)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(Matrix_Delete)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(Matrix_Search)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(Matrix_Add)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(Matrix_Multiply)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
 
-BENCHMARK(HashMap_Insert)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMap_BatchInsert)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMap_Access)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMap_Update)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMap_Delete)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMap_Search)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMap_Add)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMap_Multiply)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMap_Insert)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMap_BatchInsert)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMap_Access)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMap_Update)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMap_Delete)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMap_Search)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMap_Add)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMap_Multiply)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
 
-BENCHMARK(HashMatrix_SingleInsert)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMatrix_BatchInsert)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMatrix_Access)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMatrix_Update)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMatrix_Delete)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMatrix_Search)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMatrix_Add)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(HashMatrix_Multiply)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMatrix_SingleInsert)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMatrix_BatchInsert)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMatrix_Access)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMatrix_Update)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMatrix_Delete)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMatrix_Search)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMatrix_Add)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(HashMatrix_Multiply)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
 
-BENCHMARK(OptimizedHashMatrix_Insert)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(OptimizedHashMatrix_BatchInsert)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(OptimizedHashMatrix_Access)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(OptimizedHashMatrix_Update)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(OptimizedHashMatrix_Delete)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(OptimizedHashMatrix_Add)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
-BENCHMARK(OptimizedHashMatrix_Multiply)->RangeMultiplier(2)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(OptimizedHashMatrix_Insert)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(OptimizedHashMatrix_BatchInsert)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(OptimizedHashMatrix_Access)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(OptimizedHashMatrix_Update)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(OptimizedHashMatrix_Delete)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(OptimizedHashMatrix_Search)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(OptimizedHashMatrix_Add)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
+BENCHMARK(OptimizedHashMatrix_Multiply)->RangeMultiplier(4)->Range(64, 1024)->Unit(benchmark::kMicrosecond);
 
 BENCHMARK_MAIN();
