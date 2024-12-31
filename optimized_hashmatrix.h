@@ -42,11 +42,13 @@ private:
     size_t numRows, numCols;
 
     std::pair<int, int> getBlockCoords(int row, int col) const {
-        return {row / BLOCK_SIZE, col / BLOCK_SIZE};
+        return {row / static_cast<int>(BLOCK_SIZE), 
+                col / static_cast<int>(BLOCK_SIZE)};
     }
 
     std::pair<int, int> getLocalCoords(int row, int col) const {
-        return {row % BLOCK_SIZE, col % BLOCK_SIZE};
+        return {row % static_cast<int>(BLOCK_SIZE), 
+                col % static_cast<int>(BLOCK_SIZE)};
     }
 
     double getBlockDensity(const std::pair<int, int>& blockCoord) const {
@@ -127,7 +129,7 @@ public:
     }
 
     void insert(int row, int col, T value) {
-        if (row >= numRows || col >= numCols) {
+        if (static_cast<size_t>(row) >= numRows || static_cast<size_t>(col) >= numCols) {
             throw std::out_of_range("Matrix indices out of bounds");
         }
 
@@ -159,7 +161,7 @@ public:
     }
 
     T get(int row, int col) const {
-        if (row >= numRows || col >= numCols) {
+        if (static_cast<size_t>(row) >= numRows || static_cast<size_t>(col) >= numCols) {
             throw std::out_of_range("Matrix indices out of bounds");
         }
 
@@ -182,13 +184,15 @@ public:
      * - batchInsert(): Optimizes multiple insertions by grouping them by block
      * - This reduces the number of density recalculations and conversions
      */
-    void batchInsert(const std::vector<std::tuple<int, int, T>>& data) {
+    void batchInsert(const std::vector<std::tuple<size_t, size_t, T>>& data) {
         // Group elements by block
         std::unordered_map<std::pair<int, int>, std::vector<std::tuple<int, int, T>>, PairHash> blockGroups;
         
         for (const auto& [row, col, val] : data) {
-            auto blockCoord = getBlockCoords(row, col);
-            auto localCoord = getLocalCoords(row, col);
+            auto blockCoord = getBlockCoords(static_cast<int>(row), 
+                                           static_cast<int>(col));
+            auto localCoord = getLocalCoords(static_cast<int>(row), 
+                                           static_cast<int>(col));
             blockGroups[blockCoord].emplace_back(localCoord.first, localCoord.second, val);
         }
         
