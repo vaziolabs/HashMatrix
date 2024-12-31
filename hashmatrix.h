@@ -5,6 +5,7 @@
 #include <functional>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
 #include <omp.h>
 
 // Hash function for pair
@@ -18,15 +19,14 @@ struct PairHash {
 template <typename T>
 class HashMatrix {
 private:
-    // Using a hashmap for sparse matrix storage
     std::unordered_map<std::pair<int, int>, T, PairHash> elements;
-    mutable std::mutex mutex_; // For thread-safe operations
+    mutable std::shared_mutex mutex_; // Use shared_mutex instead of mutex for better concurrency
 
     // Internal utility to insert or update elements
     void safeInsert(int row, int col, T value) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         if (value == static_cast<T>(0)) {
-            elements.erase({row, col}); // Remove zero entries
+            elements.erase({row, col});
         } else {
             elements[{row, col}] = value;
         }
@@ -34,6 +34,26 @@ private:
 
 public:
     HashMatrix() = default;
+    
+    // Add move constructor and move assignment
+    HashMatrix(HashMatrix&& other) noexcept {
+        std::unique_lock<std::shared_mutex> lock(other.mutex_);
+        elements = std::move(other.elements);
+    }
+    
+    HashMatrix& operator=(HashMatrix&& other) noexcept {
+        if (this != &other) {
+            std::unique_lock<std::shared_mutex> lock1(mutex_, std::defer_lock);
+            std::unique_lock<std::shared_mutex> lock2(other.mutex_, std::defer_lock);
+            std::lock(lock1, lock2);
+            elements = std::move(other.elements);
+        }
+        return *this;
+    }
+
+    // Prevent copying
+    HashMatrix(const HashMatrix&) = delete;
+    HashMatrix& operator=(const HashMatrix&) = delete;
 
     // Insert or update a value
     void insert(int row, int col, T value) {
@@ -49,11 +69,14 @@ public:
     // Add two matrices
     HashMatrix<T> add(const HashMatrix<T>& other) const {
         HashMatrix<T> result;
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        
         for (const auto& [key, value] : elements) {
             result.insert(key.first, key.second, value + other.get(key.first, key.second));
         }
+        
         for (const auto& [key, value] : other.elements) {
-            if (elements.find(key) == elements.end()) { // Avoid double processing
+            if (elements.find(key) == elements.end()) {
                 result.insert(key.first, key.second, value);
             }
         }
@@ -72,12 +95,11 @@ public:
     // Matrix multiplication with parallel processing and sparsity awareness
     HashMatrix<T> multiply(const HashMatrix<T>& other, int resultCols) const {
         HashMatrix<T> result;
-
-        #pragma omp parallel for
-        for (auto it = elements.begin(); it != elements.end(); ++it) {
-            const auto& [keyA, valueA] = *it;
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        
+        for (const auto& [keyA, valueA] : elements) {
             int rowA = keyA.first, colA = keyA.second;
-
+            
             for (int colB = 0; colB < resultCols; ++colB) {
                 T valueB = other.get(colA, colB);
                 if (valueB != static_cast<T>(0)) {
