@@ -1,15 +1,15 @@
-#ifndef OPTIMIZED_HASHMATRIX_H
-#define OPTIMIZED_HASHMATRIX_H
+#ifndef optimized_hash_matrix_H
+#define optimized_hash_matrix_H
 
 #include <unordered_map>
 #include <vector>
 #include <tuple>
 #include <stdexcept>
 #include <algorithm>
-#include "hashmatrix.h"
+#include "debug.h"
 
 template <typename T, typename CoordType = size_t>
-class optimized_hashmatrix {
+class optimized_hash_matrix {
 private:
     // Replace static block size with member variable
     size_t blockSize;
@@ -177,7 +177,7 @@ public:
      * - add(): Processes dense blocks in parallel, then handles sparse elements
      */
 
-    optimized_hashmatrix(size_t rows, size_t cols, size_t block_size = 8) 
+    optimized_hash_matrix(size_t rows, size_t cols, size_t block_size = 8) 
         : numRows(rows)
         , numCols(cols)
         , blockSize(block_size)
@@ -297,7 +297,7 @@ public:
      * 3. Optimizes dense*dense multiplication
      * 4. Has special handling for sparse blocks
      */
-    optimized_hashmatrix<T> multiply(const optimized_hashmatrix<T>& other) const {
+    optimized_hash_matrix<T> multiply(const optimized_hash_matrix<T>& other) const {
         if (numCols != other.numRows) {
             throw std::invalid_argument("Matrix dimensions must match for multiplication");
         }
@@ -305,7 +305,7 @@ public:
             throw std::invalid_argument("Block sizes must match for multiplication");
         }
 
-        optimized_hashmatrix<T> result(numRows, other.numCols, blockSize);
+        optimized_hash_matrix<T> result(numRows, other.numCols, blockSize);
         size_t numBlocksK = (numCols + blockSize - 1) / blockSize;
 
         #pragma omp parallel for collapse(2)
@@ -357,12 +357,12 @@ public:
         }
     }
 
-    optimized_hashmatrix<T> add(const optimized_hashmatrix<T>& other) const {
+    optimized_hash_matrix<T> add(const optimized_hash_matrix<T>& other) const {
         if (numRows != other.numRows || numCols != other.numCols) {
             throw std::invalid_argument("Matrix dimensions must match for addition");
         }
 
-        optimized_hashmatrix<T> result(numRows, numCols);
+        optimized_hash_matrix<T> result(numRows, numCols);
 
         // Process dense blocks first
         std::set<std::pair<int, int>> processedBlocks;
@@ -415,7 +415,7 @@ public:
      */
     class Iterator {
     private:
-        const optimized_hashmatrix<T>* matrix;
+        const optimized_hash_matrix<T>* matrix;
         size_t currentRow;
         size_t currentCol;
         
@@ -433,7 +433,7 @@ public:
         }
 
     public:
-        Iterator(const optimized_hashmatrix<T>* m, size_t row = 0, size_t col = 0)
+        Iterator(const optimized_hash_matrix<T>* m, size_t row = 0, size_t col = 0)
             : matrix(m), currentRow(row), currentCol(col) {
             if (matrix) findNextNonZero();
         }
@@ -517,7 +517,7 @@ public:
 private:
     void multiplyBlocks(const std::pair<int, int>& blockA, 
                        const std::pair<int, int>& blockB,
-                       const optimized_hashmatrix<T>& other,
+                       const optimized_hash_matrix<T>& other,
                        std::vector<T>& result) const {
         bool isDenseA = denseBlocks.count(blockA);
         bool isDenseB = other.denseBlocks.count(blockB);
@@ -545,7 +545,7 @@ private:
     // Additional helper methods for sparse multiplication
     void multiplySparseBlocks(const std::pair<int, int>& blockA,
                             const std::pair<int, int>& blockB,
-                            const optimized_hashmatrix<T>& other,
+                            const optimized_hash_matrix<T>& other,
                             std::vector<T>& result) const {
         int baseRowA = blockA.first * blockSize;
         int baseColA = blockA.second * blockSize;
