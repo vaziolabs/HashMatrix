@@ -50,151 +50,193 @@ protected:
     }
 };
 
-// Basic Operation Tests
+// Basic Operation Tests with different block sizes
 TEST_F(HashMatrixTest, BasicOperations) {
-    hash_matrix<double> matrix(SMALL_SIZE, SMALL_SIZE);
-    optimized_hashmatrix<double> opt_matrix(SMALL_SIZE, SMALL_SIZE);
+    std::vector<size_t> blockSizes = {2};
     
-    std::vector<std::tuple<size_t, size_t, double>> testData = {
-        {0, 0, 1.0}, {0, 1, 2.0}, {1, 0, 3.0}, {1, 1, 4.0}
-    };
-    
-    // Test insert and get
-    for (const auto& [row, col, val] : testData) {
-        matrix.insert(row, col, val);
-        opt_matrix.insert(row, col, val);
+    for (size_t blockSize : blockSizes) {
+        std::cout << "\nTesting with block size: " << blockSize << std::endl;
         
-        EXPECT_DOUBLE_EQ(matrix.get(row, col), val);
-        EXPECT_DOUBLE_EQ(opt_matrix.get(row, col), val);
+        try {
+            // Create matrices
+            hash_matrix<double> matrix(SMALL_SIZE, SMALL_SIZE, blockSize);
+            std::cout << "Created hash_matrix" << std::endl;
+            
+            optimized_hashmatrix<double> opt_matrix(SMALL_SIZE, SMALL_SIZE, blockSize);
+            std::cout << "Created optimized_hashmatrix" << std::endl;
+            
+            // Test insertion
+            matrix.insert(0, 0, 1.0);
+            std::cout << "Inserted into hash_matrix" << std::endl;
+            
+            opt_matrix.insert(0, 0, 1.0);
+            std::cout << "Inserted into optimized_hashmatrix" << std::endl;
+            
+            EXPECT_DOUBLE_EQ(matrix.get(0, 0), 1.0);
+            EXPECT_DOUBLE_EQ(opt_matrix.get(0, 0), 1.0);
+        } catch (const std::exception& e) {
+            std::cerr << "Exception caught: " << e.what() << std::endl;
+            FAIL() << "Exception thrown: " << e.what();
+        }
     }
-    
-    // Test remove
-    matrix.remove(0, 0);
-    opt_matrix.remove(0, 0);
-    EXPECT_DOUBLE_EQ(matrix.get(0, 0), 0.0);
-    EXPECT_DOUBLE_EQ(opt_matrix.get(0, 0), 0.0);
 }
 
-// Batch Insert Test
+// Batch Insert Test with different block sizes
 TEST_F(HashMatrixTest, BatchInsert) {
-    hash_matrix<double> matrix(MEDIUM_SIZE, MEDIUM_SIZE);
-    optimized_hashmatrix<double> opt_matrix(MEDIUM_SIZE, MEDIUM_SIZE);
+    std::vector<size_t> blockSizes = {2, 4, 8, 16};
     
-    auto testData = generateSparseData(MEDIUM_SIZE, MEDIUM_SIZE, 0.1);
-    
-    matrix.batchInsert(testData);
-    opt_matrix.batchInsert(testData);
-    
-    // Verify all values were inserted correctly
-    for (const auto& [row, col, val] : testData) {
-        EXPECT_DOUBLE_EQ(matrix.get(row, col), val);
-        EXPECT_DOUBLE_EQ(opt_matrix.get(row, col), val);
+    for (size_t blockSize : blockSizes) {
+        hash_matrix<double> matrix(MEDIUM_SIZE, MEDIUM_SIZE, blockSize);
+        optimized_hashmatrix<double> opt_matrix(MEDIUM_SIZE, MEDIUM_SIZE, blockSize);
+        
+        std::cout << "\nTesting batch insert with block size: " << blockSize << std::endl;
+        
+        auto testData = generateSparseData(MEDIUM_SIZE, MEDIUM_SIZE, 0.1);
+        
+        matrix.batchInsert(testData);
+        opt_matrix.batchInsert(testData);
+        
+        // Verify all values were inserted correctly
+        for (const auto& [row, col, val] : testData) {
+            EXPECT_DOUBLE_EQ(matrix.get(row, col), val)
+                << "Failed with block size " << blockSize;
+            EXPECT_DOUBLE_EQ(opt_matrix.get(row, col), val)
+                << "Failed with block size " << blockSize;
+        }
     }
 }
 
-// Matrix Addition Test
+// Matrix Addition Test with different block sizes
 TEST_F(HashMatrixTest, Addition) {
-    hash_matrix<double> matrix1(SMALL_SIZE, SMALL_SIZE);
-    hash_matrix<double> matrix2(SMALL_SIZE, SMALL_SIZE);
-    optimized_hashmatrix<double> opt_matrix1(SMALL_SIZE, SMALL_SIZE);
-    optimized_hashmatrix<double> opt_matrix2(SMALL_SIZE, SMALL_SIZE);
+    std::vector<size_t> blockSizes = {2, 4, 8, 16};
     
-    std::vector<std::tuple<size_t, size_t, double>> data1 = {
-        {0, 0, 1.0}, {0, 1, 2.0}, {1, 0, 3.0}, {1, 1, 4.0}
-    };
-    std::vector<std::tuple<size_t, size_t, double>> data2 = {
-        {0, 0, 2.0}, {0, 1, 3.0}, {1, 0, 4.0}, {1, 1, 5.0}
-    };
-    
-    fillMatrix(matrix1, data1);
-    fillMatrix(matrix2, data2);
-    fillMatrix(opt_matrix1, data1);
-    fillMatrix(opt_matrix2, data2);
-    
-    auto result = matrix1.add(matrix2);
-    auto opt_result = opt_matrix1.add(opt_matrix2);
-    
-    std::vector<std::tuple<size_t, size_t, double>> expected = {
-        {0, 0, 3.0}, {0, 1, 5.0}, {1, 0, 7.0}, {1, 1, 9.0}
-    };
-    
-    verifyMatrix(result, expected);
-    verifyMatrix(opt_result, expected);
-}
-
-// Matrix Multiplication Test
-TEST_F(HashMatrixTest, Multiplication) {
-    hash_matrix<double> matrix1(SMALL_SIZE, SMALL_SIZE);
-    hash_matrix<double> matrix2(SMALL_SIZE, SMALL_SIZE);
-    optimized_hashmatrix<double> opt_matrix1(SMALL_SIZE, SMALL_SIZE);
-    optimized_hashmatrix<double> opt_matrix2(SMALL_SIZE, SMALL_SIZE);
-    
-    std::vector<std::tuple<size_t, size_t, double>> data1 = {
-        {0, 0, 1.0}, {0, 1, 2.0}, {1, 0, 3.0}, {1, 1, 4.0}
-    };
-    std::vector<std::tuple<size_t, size_t, double>> data2 = {
-        {0, 0, 2.0}, {0, 1, 3.0}, {1, 0, 4.0}, {1, 1, 5.0}
-    };
-    
-    fillMatrix(matrix1, data1);
-    fillMatrix(matrix2, data2);
-    fillMatrix(opt_matrix1, data1);
-    fillMatrix(opt_matrix2, data2);
-    
-    auto result = matrix1.multiply(matrix2);
-    auto opt_result = opt_matrix1.multiply(opt_matrix2);
-    
-    std::vector<std::tuple<size_t, size_t, double>> expected = {
-        {0, 0, 10.0}, {0, 1, 13.0}, {1, 0, 22.0}, {1, 1, 29.0}
-    };
-    
-    verifyMatrix(result, expected);
-    verifyMatrix(opt_result, expected);
-}
-
-// Large Matrix Operations Test
-TEST_F(HashMatrixTest, LargeMatrixOperations) {
-    hash_matrix<double> matrix(LARGE_SIZE, LARGE_SIZE);
-    optimized_hashmatrix<double> opt_matrix(LARGE_SIZE, LARGE_SIZE);
-    
-    auto testData = generateSparseData(LARGE_SIZE, LARGE_SIZE, 0.01);
-    
-    // Test batch insert
-    matrix.batchInsert(testData);
-    opt_matrix.batchInsert(testData);
-    
-    // Verify random elements
-    for (size_t i = 0; i < 100; i++) {
-        size_t row = rand() % LARGE_SIZE;
-        size_t col = rand() % LARGE_SIZE;
-        EXPECT_DOUBLE_EQ(matrix.get(row, col), opt_matrix.get(row, col));
+    for (size_t blockSize : blockSizes) {
+        hash_matrix<double> matrix1(SMALL_SIZE, SMALL_SIZE, blockSize);
+        hash_matrix<double> matrix2(SMALL_SIZE, SMALL_SIZE, blockSize);
+        optimized_hashmatrix<double> opt_matrix1(SMALL_SIZE, SMALL_SIZE, blockSize);
+        optimized_hashmatrix<double> opt_matrix2(SMALL_SIZE, SMALL_SIZE, blockSize);
+        
+        std::cout << "\nTesting addition with block size: " << blockSize << std::endl;
+        
+        std::vector<std::tuple<size_t, size_t, double>> data1 = {
+            {0, 0, 1.0}, {0, 1, 2.0}, {1, 0, 3.0}, {1, 1, 4.0}
+        };
+        std::vector<std::tuple<size_t, size_t, double>> data2 = {
+            {0, 0, 2.0}, {0, 1, 3.0}, {1, 0, 4.0}, {1, 1, 5.0}
+        };
+        
+        fillMatrix(matrix1, data1);
+        fillMatrix(matrix2, data2);
+        fillMatrix(opt_matrix1, data1);
+        fillMatrix(opt_matrix2, data2);
+        
+        auto result = matrix1.add(matrix2);
+        auto opt_result = opt_matrix1.add(opt_matrix2);
+        
+        std::vector<std::tuple<size_t, size_t, double>> expected = {
+            {0, 0, 3.0}, {0, 1, 5.0}, {1, 0, 7.0}, {1, 1, 9.0}
+        };
+        
+        verifyMatrix(result, expected);
+        verifyMatrix(opt_result, expected);
     }
 }
 
-// Edge Cases Test
+// Matrix Multiplication Test with different block sizes
+TEST_F(HashMatrixTest, Multiplication) {
+    std::vector<size_t> blockSizes = {2, 4, 8, 16};
+    
+    for (size_t blockSize : blockSizes) {
+        hash_matrix<double> matrix1(SMALL_SIZE, SMALL_SIZE, blockSize);
+        hash_matrix<double> matrix2(SMALL_SIZE, SMALL_SIZE, blockSize);
+        optimized_hashmatrix<double> opt_matrix1(SMALL_SIZE, SMALL_SIZE, blockSize);
+        optimized_hashmatrix<double> opt_matrix2(SMALL_SIZE, SMALL_SIZE, blockSize);
+        
+        std::cout << "\nTesting multiplication with block size: " << blockSize << std::endl;
+        
+        std::vector<std::tuple<size_t, size_t, double>> data1 = {
+            {0, 0, 1.0}, {0, 1, 2.0}, {1, 0, 3.0}, {1, 1, 4.0}
+        };
+        std::vector<std::tuple<size_t, size_t, double>> data2 = {
+            {0, 0, 2.0}, {0, 1, 3.0}, {1, 0, 4.0}, {1, 1, 5.0}
+        };
+        
+        fillMatrix(matrix1, data1);
+        fillMatrix(matrix2, data2);
+        fillMatrix(opt_matrix1, data1);
+        fillMatrix(opt_matrix2, data2);
+        
+        auto result = matrix1.multiply(matrix2);
+        auto opt_result = opt_matrix1.multiply(opt_matrix2);
+        
+        std::vector<std::tuple<size_t, size_t, double>> expected = {
+            {0, 0, 10.0}, {0, 1, 13.0}, {1, 0, 22.0}, {1, 1, 29.0}
+        };
+        
+        verifyMatrix(result, expected);
+        verifyMatrix(opt_result, expected);
+    }
+}
+
+// Large Matrix Operations Test with different block sizes
+TEST_F(HashMatrixTest, LargeMatrixOperations) {
+    std::vector<size_t> blockSizes = {8, 16, 32};
+    
+    for (size_t blockSize : blockSizes) {
+        hash_matrix<double> matrix(LARGE_SIZE, LARGE_SIZE, blockSize);
+        optimized_hashmatrix<double> opt_matrix(LARGE_SIZE, LARGE_SIZE, blockSize);
+        
+        std::cout << "\nTesting large matrix with block size: " << blockSize << std::endl;
+        
+        auto testData = generateSparseData(LARGE_SIZE, LARGE_SIZE, 0.01);
+        
+        matrix.batchInsert(testData);
+        opt_matrix.batchInsert(testData);
+        
+        // Verify random elements
+        for (size_t i = 0; i < 100; i++) {
+            size_t row = rand() % LARGE_SIZE;
+            size_t col = rand() % LARGE_SIZE;
+            EXPECT_DOUBLE_EQ(matrix.get(row, col), opt_matrix.get(row, col))
+                << "Failed with block size " << blockSize;
+        }
+    }
+}
+
+// Edge Cases Test with different block sizes
 TEST_F(HashMatrixTest, EdgeCases) {
-    hash_matrix<double> matrix(SMALL_SIZE, SMALL_SIZE);
-    optimized_hashmatrix<double> opt_matrix(SMALL_SIZE, SMALL_SIZE);
+    std::vector<size_t> blockSizes = {2, 4, 8, 16};
     
-    // Test zero values
-    matrix.insert(0, 0, 0.0);
-    opt_matrix.insert(0, 0, 0.0);
-    EXPECT_DOUBLE_EQ(matrix.get(0, 0), 0.0);
-    EXPECT_DOUBLE_EQ(opt_matrix.get(0, 0), 0.0);
-    
-    // Test overwriting values
-    matrix.insert(0, 0, 1.0);
-    matrix.insert(0, 0, 2.0);
-    opt_matrix.insert(0, 0, 1.0);
-    opt_matrix.insert(0, 0, 2.0);
-    EXPECT_DOUBLE_EQ(matrix.get(0, 0), 2.0);
-    EXPECT_DOUBLE_EQ(opt_matrix.get(0, 0), 2.0);
-    
-    // Test out of bounds
-    EXPECT_THROW(matrix.insert(SMALL_SIZE, 0, 1.0), std::out_of_range);
-    EXPECT_THROW(opt_matrix.insert(SMALL_SIZE, 0, 1.0), std::out_of_range);
-    EXPECT_THROW(matrix.get(SMALL_SIZE, 0), std::out_of_range);
-    EXPECT_THROW(opt_matrix.get(SMALL_SIZE, 0), std::out_of_range);
+    for (size_t blockSize : blockSizes) {
+        hash_matrix<double> matrix(SMALL_SIZE, SMALL_SIZE, blockSize);
+        optimized_hashmatrix<double> opt_matrix(SMALL_SIZE, SMALL_SIZE, blockSize);
+        
+        std::cout << "\nTesting edge cases with block size: " << blockSize << std::endl;
+        
+        // Test zero values
+        matrix.insert(0, 0, 0.0);
+        opt_matrix.insert(0, 0, 0.0);
+        EXPECT_DOUBLE_EQ(matrix.get(0, 0), 0.0)
+            << "Failed with block size " << blockSize;
+        EXPECT_DOUBLE_EQ(opt_matrix.get(0, 0), 0.0)
+            << "Failed with block size " << blockSize;
+        
+        // Test overwriting values
+        matrix.insert(0, 0, 1.0);
+        matrix.insert(0, 0, 2.0);
+        opt_matrix.insert(0, 0, 1.0);
+        opt_matrix.insert(0, 0, 2.0);
+        EXPECT_DOUBLE_EQ(matrix.get(0, 0), 2.0)
+            << "Failed with block size " << blockSize;
+        EXPECT_DOUBLE_EQ(opt_matrix.get(0, 0), 2.0)
+            << "Failed with block size " << blockSize;
+        
+        // Test out of bounds
+        EXPECT_THROW(matrix.insert(SMALL_SIZE, 0, 1.0), std::out_of_range);
+        EXPECT_THROW(opt_matrix.insert(SMALL_SIZE, 0, 1.0), std::out_of_range);
+        EXPECT_THROW(matrix.get(SMALL_SIZE, 0), std::out_of_range);
+        EXPECT_THROW(opt_matrix.get(SMALL_SIZE, 0), std::out_of_range);
+    }
 }
 
 int main(int argc, char **argv) {

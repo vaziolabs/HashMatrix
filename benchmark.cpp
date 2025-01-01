@@ -6,19 +6,20 @@
 #include <random>
 
 struct TestData {
-    std::vector<std::tuple<int, int, double>> sparseData;
-    std::vector<std::tuple<int, int, double>> queryData;
-    std::vector<std::tuple<int, int, double>> updateData;
-    std::vector<std::pair<int, int>> deleteData;
+    using coord_t = size_t;  // Consistent coordinate type
+    std::vector<std::tuple<coord_t, coord_t, double>> sparseData;
+    std::vector<std::tuple<size_t, size_t, double>> queryData;
+    std::vector<std::tuple<size_t, size_t, double>> updateData;
+    std::vector<std::pair<size_t, size_t>> deleteData;
     
-    static TestData generate(int size, double sparsity) {
+    static TestData generate(coord_t size, double sparsity) {
         TestData data;
         std::mt19937 rng(std::random_device{}());
         std::uniform_real_distribution<double> dist(0.0, 1.0);
         
         // Generate initial sparse data
-        for (int i = 0; i < size; i++) {
-            for (int j = 0; j < size; j++) {
+        for (coord_t i = 0; i < size; i++) {
+            for (coord_t j = 0; j < size; j++) {
                 if (dist(rng) < sparsity) {
                     data.sparseData.emplace_back(i, j, dist(rng));
                 }
@@ -54,10 +55,10 @@ struct TestData {
         return data;
     }
 
-    std::vector<std::tuple<int, int, double>> generateBatchData(int size, int batchSize) const {
-        std::vector<std::tuple<int, int, double>> batch;
+    std::vector<std::tuple<size_t, size_t, double>> generateBatchData(size_t size, size_t batchSize) const {
+        std::vector<std::tuple<size_t, size_t, double>> batch;
         batch.reserve(batchSize);
-        for (int i = 0; i < batchSize && i < sparseData.size(); ++i) {
+        for (size_t i = 0; i < batchSize && i < sparseData.size(); ++i) {
             batch.push_back(sparseData[i]);
         }
         return batch;
@@ -408,7 +409,7 @@ static void HashMatrix_Access(benchmark::State& state) {
     const double sparsity = 0.01;
     auto testData = TestData::generate(size, sparsity);
     
-    hash_matrix<double> matrix(size, size);
+    hash_matrix<double, size_t> matrix(size, size);
     auto batchData = testData.generateBatchData(size, testData.sparseData.size());
     matrix.batchInsert(batchData);
     
@@ -426,11 +427,13 @@ static void HashMatrix_Update(benchmark::State& state) {
     const double sparsity = 0.01;
     auto testData = TestData::generate(size, sparsity);
     
-    hash_matrix<double> matrix(size, size);
+    hash_matrix<double, size_t> matrix(size, size);
     
     for (auto _ : state) {
         for (const auto& [i, j, val] : testData.updateData) {
-            matrix.insert(i, j, val);
+            if (i < size && j < size) {  // Add bounds checking
+                matrix.insert(i, j, val);
+            }
         }
         benchmark::DoNotOptimize(matrix);
     }
@@ -444,14 +447,14 @@ static void HashMatrix_Add(benchmark::State& state) {
     const int size = state.range(0);
     const double sparsity = 0.01;
     
-    hash_matrix<double> matrix1(size, size), matrix2(size, size);
+    hash_matrix<double, size_t> matrix1(size, size), matrix2(size, size);
     auto testData = TestData::generate(size, sparsity);
     
     // Initialize matrices using batch insert
     auto batchData = testData.generateBatchData(size, testData.sparseData.size());
     matrix1.batchInsert(batchData);
     
-    std::vector<std::tuple<int, int, double>> scaledData;
+    std::vector<std::tuple<size_t, size_t, double>> scaledData;
     scaledData.reserve(batchData.size());
     for (const auto& [i, j, val] : batchData) {
         scaledData.emplace_back(i, j, val * 0.5);
@@ -465,23 +468,26 @@ static void HashMatrix_Add(benchmark::State& state) {
 }
 
 static void HashMatrix_Multiply(benchmark::State& state) {
-    const int size = state.range(0);
+    const size_t size = state.range(0);
     const double sparsity = 0.01;
-    
-    hash_matrix<double> matrix1(size, size);
-    hash_matrix<double> matrix2(size, size);
     auto testData = TestData::generate(size, sparsity);
     
-    // Initialize matrices
-    matrix1.batchInsert(testData.sparseData);
-    std::vector<std::tuple<int, int, double>> scaledData;
+    hash_matrix<double, size_t> matrix1(size, size);
+    hash_matrix<double, size_t> matrix2(size, size);
+    
+    // Create scaled data for second matrix
+    std::vector<std::tuple<size_t, size_t, double>> scaledData;
+    scaledData.reserve(testData.sparseData.size());
     for (const auto& [i, j, val] : testData.sparseData) {
         scaledData.emplace_back(i, j, val * 0.5);
     }
+    
+    // Initialize matrices
+    matrix1.batchInsert(testData.sparseData);
     matrix2.batchInsert(scaledData);
     
     for (auto _ : state) {
-        auto result = matrix1.multiply(matrix2);
+        auto result = matrix1 * matrix2;  // Use operator* instead of multiply
         benchmark::DoNotOptimize(result);
     }
 }
@@ -491,7 +497,7 @@ static void HashMatrix_Search(benchmark::State& state) {
     const double sparsity = 0.01;
     auto testData = TestData::generate(size, sparsity);
     
-    hash_matrix<double> matrix(size, size);
+    hash_matrix<double, size_t> matrix(size, size);
     auto batchData = testData.generateBatchData(size, testData.sparseData.size());
     matrix.batchInsert(batchData);
     
@@ -513,7 +519,7 @@ static void HashMatrix_SingleInsert(benchmark::State& state) {
     auto testData = TestData::generate(size, sparsity);
     
     for (auto _ : state) {
-        hash_matrix<double> matrix(size, size);
+        hash_matrix<double, size_t> matrix(size, size);
         for (const auto& [i, j, val] : testData.sparseData) {
             matrix.insert(i, j, val);
         }
@@ -528,7 +534,7 @@ static void HashMatrix_BatchInsert(benchmark::State& state) {
     auto batchData = testData.generateBatchData(size, testData.sparseData.size());
     
     for (auto _ : state) {
-        hash_matrix<double> matrix(size, size);
+        hash_matrix<double, size_t> matrix(size, size);
         matrix.batchInsert(batchData);
         benchmark::DoNotOptimize(matrix);
     }
@@ -540,12 +546,16 @@ static void HashMatrix_Delete(benchmark::State& state) {
     auto testData = TestData::generate(size, sparsity);
     
     for (auto _ : state) {
-        hash_matrix<double> matrix(size, size);
-        // Insert data
-        matrix.batchInsert(testData.sparseData);
-        // Delete operations
+        hash_matrix<double, size_t> matrix(size, size);
+        // Insert data using batch insert
+        auto batchData = testData.generateBatchData(size, testData.sparseData.size());
+        matrix.batchInsert(batchData);
+        
+        // Delete operations with bounds checking
         for (const auto& [i, j] : testData.deleteData) {
-            matrix.remove(i, j);
+            if (i < size && j < size) {  // Add bounds checking
+                matrix.remove(i, j);
+            }
         }
         benchmark::DoNotOptimize(matrix);
     }
@@ -561,7 +571,7 @@ static void OptimizedHashMatrix_Insert(benchmark::State& state) {
     auto testData = TestData::generate(size, sparsity);
     
     for (auto _ : state) {
-        optimized_hashmatrix<double> matrix(size, size);
+        optimized_hashmatrix<double, size_t> matrix(size, size);
         for (const auto& [i, j, val] : testData.sparseData) {
             matrix.insert(i, j, val);
         }
@@ -576,7 +586,7 @@ static void OptimizedHashMatrix_BatchInsert(benchmark::State& state) {
     auto batchData = testData.generateBatchData(size, testData.sparseData.size());
     
     for (auto _ : state) {
-        optimized_hashmatrix<double> matrix(size, size);
+        optimized_hashmatrix<double, size_t> matrix(size, size);
         matrix.batchInsert(batchData);
         benchmark::DoNotOptimize(matrix);
     }
@@ -587,7 +597,7 @@ static void OptimizedHashMatrix_Access(benchmark::State& state) {
     const double sparsity = 0.01;
     auto testData = TestData::generate(size, sparsity);
     
-    optimized_hashmatrix<double> matrix(size, size);
+    optimized_hashmatrix<double, size_t> matrix(size, size);
     matrix.batchInsert(testData.sparseData);
     
     for (auto _ : state) {
@@ -604,7 +614,7 @@ static void OptimizedHashMatrix_Update(benchmark::State& state) {
     const double sparsity = 0.01;
     auto testData = TestData::generate(size, sparsity);
     
-    optimized_hashmatrix<double> matrix(size, size);
+    optimized_hashmatrix<double, size_t> matrix(size, size);
     
     for (auto _ : state) {
         for (const auto& [i, j, val] : testData.updateData) {
@@ -620,7 +630,7 @@ static void OptimizedHashMatrix_Delete(benchmark::State& state) {
     auto testData = TestData::generate(size, sparsity);
     
     for (auto _ : state) {
-        optimized_hashmatrix<double> matrix(size, size);
+        optimized_hashmatrix<double, size_t> matrix(size, size);
         matrix.batchInsert(testData.sparseData);
         for (const auto& [i, j] : testData.deleteData) {
             matrix.remove(i, j);
@@ -633,8 +643,8 @@ static void OptimizedHashMatrix_Add(benchmark::State& state) {
     const int size = state.range(0);
     const double sparsity = 0.01;
     
-    optimized_hashmatrix<double> matrix1(size, size);
-    optimized_hashmatrix<double> matrix2(size, size);
+    optimized_hashmatrix<double, size_t> matrix1(size, size);
+    optimized_hashmatrix<double, size_t> matrix2(size, size);
     auto testData = TestData::generate(size, sparsity);
     
     // Initialize matrices
@@ -655,8 +665,8 @@ static void OptimizedHashMatrix_Multiply(benchmark::State& state) {
     const int size = state.range(0);
     const double sparsity = 0.01;
     
-    optimized_hashmatrix<double> matrix1(size, size);
-    optimized_hashmatrix<double> matrix2(size, size);
+    optimized_hashmatrix<double, size_t> matrix1(size, size);
+    optimized_hashmatrix<double, size_t> matrix2(size, size);
     auto testData = TestData::generate(size, sparsity);
     
     matrix1.batchInsert(testData.sparseData);
@@ -677,7 +687,7 @@ static void OptimizedHashMatrix_Search(benchmark::State& state) {
     const double sparsity = 0.01;
     auto testData = TestData::generate(size, sparsity);
     
-    optimized_hashmatrix<double> matrix(size, size);
+    optimized_hashmatrix<double, int> matrix(size, size);
     auto batchData = testData.generateBatchData(size, testData.sparseData.size());
     matrix.batchInsert(batchData);
     

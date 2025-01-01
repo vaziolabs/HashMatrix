@@ -12,6 +12,11 @@
 #include <cpuid.h>
 #include <algorithm>  // for std::sort, std::count_if
 #include <utility>    // for std::pair
+#include <functional>
+#include <cstdint>    // Add for uintmax_t
+#include <limits>     // Add for numeric_limits
+#include <type_traits>  // Add for type traits
+#include <cstring>  // for std::memcpy
 
 /**
  * @brief Custom hash function for matrix coordinates
@@ -37,12 +42,231 @@ struct PairHash {
  * 
  * @tparam T The data type of matrix elements (typically numeric types)
  */
-template <typename T>
+template <typename T, typename CoordType = size_t>
 class hash_matrix {
 private:
-    /** @brief Size of matrix blocks for storage optimization */
-    static constexpr size_t BLOCK_SIZE = 64;
+    size_t numRows;
+    size_t numCols;
+    size_t blockSize;  // Dynamic block size
     
+    // Define SparseBlock type at the beginning
+    using SparseBlock = std::unordered_map<std::pair<CoordType, CoordType>, T, PairHash>;
+
+    enum class BlockType {
+        EMPTY,
+        ULTRA_SPARSE,
+        SPARSE,
+        DENSE,
+        FULL
+    };
+
+    // Move BlockMetadata definition before the functions that use it
+    struct BlockMetadata {
+        size_t dataIndex;      ///< Index into memory pool
+        BlockType type;        ///< Storage format type
+        size_t nonZeroCount;   ///< Number of non-zero elements
+        double density;        ///< Ratio of non-zero elements to total elements
+        void* dataPtr;         ///< Direct pointer to block data
+
+        BlockMetadata() : dataIndex(0), type(BlockType::SPARSE), 
+                         nonZeroCount(0), density(0.0), dataPtr(nullptr) {}
+    };
+
+    std::unordered_map<std::pair<CoordType, CoordType>, BlockMetadata, PairHash> blockIndex;
+
+    std::pair<CoordType, CoordType> getLocalCoords(size_t row, size_t col) const {
+        return {static_cast<CoordType>(row % blockSize), 
+                static_cast<CoordType>(col % blockSize)};
+    }
+
+    // Move coordinate conversion to private section
+    struct CoordConverter {
+        template<typename InputType>
+        static CoordType convert(InputType val) {
+            static_assert(std::is_arithmetic_v<InputType>, 
+                         "Coordinate type must be arithmetic");
+                         
+            if constexpr (std::is_signed_v<InputType> && std::is_unsigned_v<CoordType>) {
+                if (val < 0) {
+                    throw std::out_of_range("Negative value not allowed for unsigned type");
+                }
+            }
+            
+            if (static_cast<std::uint64_t>(val) > std::numeric_limits<CoordType>::max()) {
+                throw std::out_of_range("Value out of range for coordinate type");
+            }
+            
+            return static_cast<CoordType>(val);
+        }
+    };
+
+    // Memory management class
+    class MemoryPool {
+    private:
+        struct Block {
+            void* ptr;
+            size_t size;
+            std::function<void(void*)> deleter;
+            
+            Block(void* p, size_t s, std::function<void(void*)> d)
+                : ptr(p), size(s), deleter(std::move(d)) {}
+            ~Block() {
+                if (ptr && deleter) deleter(ptr);
+            }
+            
+            // Delete copy operations
+            Block(const Block&) = delete;
+            Block& operator=(const Block&) = delete;
+            
+            // Allow move operations
+            Block(Block&& other) noexcept
+                : ptr(other.ptr), size(other.size), deleter(std::move(other.deleter)) {
+                other.ptr = nullptr;
+            }
+            Block& operator=(Block&& other) noexcept {
+                if (this != &other) {
+                    if (ptr && deleter) deleter(ptr);
+                    ptr = other.ptr;
+                    size = other.size;
+                    deleter = std::move(other.deleter);
+                    other.ptr = nullptr;
+                }
+                return *this;
+            }
+        };
+        
+        std::vector<Block> blocks;
+
+    public:
+        // Add default constructor
+        MemoryPool() = default;
+
+        // Copy constructor
+        MemoryPool(const MemoryPool& other) {
+            // Deep copy of blocks
+            for (const auto& block : other.blocks) {
+                if (block.ptr) {
+                    void* newPtr = ::operator new(block.size);
+                    std::memcpy(newPtr, block.ptr, block.size);
+                    blocks.emplace_back(newPtr, block.size, block.deleter);
+                }
+            }
+        }
+
+        // Move constructor
+        MemoryPool(MemoryPool&& other) noexcept = default;
+
+        // Add copy assignment operator
+        MemoryPool& operator=(const MemoryPool& other) {
+            if (this != &other) {
+                MemoryPool temp(other);
+                std::swap(blocks, temp.blocks);
+            }
+            return *this;
+        }
+
+        // Add move assignment operator
+        MemoryPool& operator=(MemoryPool&& other) noexcept = default;
+
+        ~MemoryPool() = default;
+
+        template<typename U>
+        U* allocate(size_t count) {
+            U* ptr = new U[count];
+            blocks.emplace_back(ptr, count * sizeof(U),
+                [](void* p) { delete[] static_cast<U*>(p); });
+            return ptr;
+        }
+
+        void* allocateRaw(size_t bytes, std::function<void(void*)> deleter) {
+            void* ptr = ::operator new(bytes);
+            blocks.emplace_back(ptr, bytes, std::move(deleter));
+            return ptr;
+        }
+    };
+
+    // Now these functions can use BlockMetadata
+    void validateBlockAccess(const BlockMetadata& metadata) const {
+        if (!metadata.dataPtr) {
+            throw std::runtime_error("Attempting to access null block pointer");
+        }
+    }
+
+    T* getBlockData(BlockMetadata& metadata) {
+        validateBlockAccess(metadata);
+        return static_cast<T*>(metadata.dataPtr);
+    }
+
+    const T* getBlockData(const BlockMetadata& metadata) const {
+        validateBlockAccess(metadata);
+        return static_cast<const T*>(metadata.dataPtr);
+    }
+
+    void convertBlockToDense(const std::pair<CoordType, CoordType>& blockCoord) {
+        auto& block = blockIndex[blockCoord];
+        if (block.type != BlockType::SPARSE) return;
+
+        auto* sparseBlock = static_cast<SparseBlock*>(block.dataPtr);
+        T* denseBlock = new T[blockSize * blockSize]();  // Initialize with zeros
+
+        // Copy data from sparse to dense
+        for (const auto& entry : *sparseBlock) {
+            size_t offset = entry.first.first * blockSize + entry.first.second;
+            denseBlock[offset] = entry.second;
+        }
+
+        // Clean up old sparse block and update metadata
+        delete sparseBlock;
+        block.dataPtr = denseBlock;
+        block.type = BlockType::DENSE;
+    }
+
+public:  // Make public interface clear
+    void insert(CoordType row, CoordType col, const T& value) {
+        checkBounds(row, col);
+        if (value == T{}) return;
+
+        auto blockCoord = getBlockCoords(row, col);
+        auto localCoord = getLocalCoords(row, col);
+        
+        auto& block = blockIndex[blockCoord];
+        if (block.type == BlockType::EMPTY) {
+            // Initialize new block
+            block.type = BlockType::SPARSE;
+            block.dataPtr = new SparseBlock();
+        }
+
+        if (block.type == BlockType::SPARSE) {
+            auto* sparseBlock = static_cast<SparseBlock*>(block.dataPtr);
+            std::pair<CoordType, CoordType> key(localCoord.first, localCoord.second);
+            sparseBlock->insert({key, value});
+            
+            // Convert to dense if threshold reached
+            if (sparseBlock->size() > (blockSize * blockSize) / 2) {
+                convertBlockToDense(blockCoord);
+            }
+        } else {
+            auto* denseData = static_cast<T*>(block.dataPtr);
+            denseData[localCoord.first * blockSize + localCoord.second] = value;
+        }
+    }
+
+    T get(CoordType row, CoordType col) const {
+        checkBounds(row, col);
+        
+        const auto& metadata = getBlockMetadata(row, col);
+        if (metadata.type == BlockType::DENSE) {
+            auto* block = static_cast<T*>(metadata.dataPtr);
+            return block[getLocalOffset(row, col)];
+        }
+        auto* sparseBlock = static_cast<const SparseBlock*>(metadata.dataPtr);
+        if (!sparseBlock) return T{};
+        
+        auto it = sparseBlock->find({row % blockSize, col % blockSize});
+        return it != sparseBlock->end() ? it->second : T{};
+    }
+
+private:
     /** @brief Density threshold for ultra-sparse storage */
     static constexpr double ULTRA_SPARSE_THRESHOLD = 0.1;
     
@@ -52,255 +276,21 @@ private:
     /** @brief Density threshold for dense storage */
     static constexpr double DENSE_THRESHOLD = 0.9;
 
-    /**
-     * @brief Enumeration of block storage types based on density
-     * 
-     * Used to optimize storage and operations based on element density within blocks
-     */
-    enum class BlockType {
-        ULTRA_SPARSE,  // < 10% density
-        SPARSE,        // < 50% density
-        DENSE,         // >= 50% density
-        FULL          // > 90% density
-    };
-
-    /**
-     * @brief Metadata for matrix blocks
-     * 
-     * Stores information about block storage type, element count, and storage location
-     */
-    struct BlockMetadata {
-        BlockType type;           ///< Storage format type
-        size_t nonZeroCount;     ///< Number of non-zero elements
-        size_t dataIndex;        ///< Index into appropriate storage
-        double density;          ///< Ratio of non-zero elements
-
-        BlockMetadata() : type(BlockType::ULTRA_SPARSE), nonZeroCount(0), dataIndex(0), density(0.0) {}
-    };
-
-    /**
-     * @brief Custom memory pool for efficient matrix element storage
-     * 
-     * Implements a block-based memory allocator with alignment and caching
-     * optimizations for matrix operations
-     */
-    class MemoryPool {
-    private:
-        /** @brief Size of memory blocks in bytes */
-        static constexpr size_t POOL_BLOCK_SIZE = 1024 * 1024; // 1MB blocks
-        
-        /** @brief Cache line size for alignment */
-        static constexpr size_t CACHE_LINE_SIZE = 64;
-        
-        /**
-         * @brief Memory block structure with cache line alignment
-         */
-        struct alignas(CACHE_LINE_SIZE) MemoryBlock {
-            char data[POOL_BLOCK_SIZE];  ///< Raw storage
-            size_t used;                 ///< Bytes allocated
-            MemoryBlock() : used(0) {}
-        };
-        
-        std::vector<std::unique_ptr<MemoryBlock>> blocks;
-        std::vector<std::pair<void*, size_t>> freeList; // ptr, size pairs
-
-    public:
-        /**
-         * @brief Default constructor for MemoryPool
-         */
-        MemoryPool() = default;
-        
-        // Delete copy operations to prevent accidental sharing of memory resources
-        MemoryPool(const MemoryPool&) = delete;
-        MemoryPool& operator=(const MemoryPool&) = delete;
-        
-        // Enable move semantics for efficient resource transfer
-        MemoryPool(MemoryPool&&) = default;
-        MemoryPool& operator=(MemoryPool&&) = default;
-
-        /**
-         * @brief Allocates memory for a specified number of elements
-         * 
-         * Implements a sophisticated allocation strategy that:
-         * 1. Checks the free list for available space
-         * 2. Reuses existing blocks when possible
-         * 3. Creates new blocks when necessary
-         * 4. Maintains proper alignment requirements
-         * 
-         * @tparam U Type of elements to allocate
-         * @param count Number of elements to allocate
-         * @return Pointer to allocated memory
-         */
-        template<typename U>
-        U* allocate(size_t count) {
-            size_t size = count * sizeof(U);
-            size_t alignment = alignof(U);
-            
-            // Try to find suitable space in free list
-            for (auto it = freeList.begin(); it != freeList.end(); ++it) {
-                if (it->second >= size) {
-                    void* ptr = it->first;
-                    if (it->second == size) {
-                        freeList.erase(it);
-                    } else {
-                        it->first = static_cast<char*>(it->first) + size;
-                        it->second -= size;
-                    }
-                    return static_cast<U*>(ptr);
-                }
-            }
-
-            // Search existing blocks for available space
-            for (auto& block : blocks) {
-                size_t aligned_offset = (block->used + alignment - 1) & ~(alignment - 1);
-                if (aligned_offset + size <= POOL_BLOCK_SIZE) {
-                    block->used = aligned_offset + size;
-                    return reinterpret_cast<U*>(block->data + aligned_offset);
-                }
-            }
-
-            // Allocate new block when necessary
-            auto newBlock = std::make_unique<MemoryBlock>();
-            size_t aligned_offset = (alignment - 1) & ~(alignment - 1);
-            newBlock->used = aligned_offset + size;
-            U* result = reinterpret_cast<U*>(newBlock->data + aligned_offset);
-            blocks.push_back(std::move(newBlock));
-            return result;
-        }
-
-        /**
-         * @brief Deallocates previously allocated memory
-         * 
-         * Adds the memory back to the free list and performs coalescing
-         * of adjacent free blocks when possible.
-         * 
-         * @param ptr Pointer to memory to deallocate
-         * @param size Size of memory block in bytes
-         */
-        void deallocate(void* ptr, size_t size) {
-            freeList.emplace_back(ptr, size);
-            
-            // Coalesce adjacent free blocks for better memory utilization
-            if (freeList.size() > 1) {
-                std::sort(freeList.begin(), freeList.end());
-                for (size_t i = 1; i < freeList.size(); ) {
-                    auto& prev = freeList[i-1];
-                    auto& curr = freeList[i];
-                    if (static_cast<char*>(prev.first) + prev.second == curr.first) {
-                        prev.second += curr.second;
-                        freeList.erase(freeList.begin() + i);
-                    } else {
-                        ++i;
-                    }
-                }
-            }
-        }
-
-        /**
-         * @brief Destructor that ensures proper cleanup of memory resources
-         */
-        ~MemoryPool() {
-            blocks.clear();
-            freeList.clear();
-        }
-
-        /**
-         * @brief Resets the memory pool to its initial state
-         * 
-         * Maintains allocated blocks but marks them as unused
-         */
-        void clear() {
-            for (auto& block : blocks) {
-                block->used = 0;
-            }
-            freeList.clear();
-        }
-
-        /**
-         * @brief Returns total allocated size in bytes
-         */
-        size_t getAllocatedSize() const {
-            return blocks.size() * POOL_BLOCK_SIZE;
-        }
-
-        /**
-         * @brief Returns total used size in bytes
-         */
-        size_t getUsedSize() const {
-            size_t used = 0;
-            for (const auto& block : blocks) {
-                used += block->used;
-            }
-            return used;
-        }
-
-        /**
-         * @brief Retrieves a reference to a stored element
-         * 
-         * @tparam U Type of element to retrieve
-         * @param index Block index to access
-         * @return Reference to the stored element
-         * @throws std::out_of_range if index is invalid
-         */
-        template<typename U>
-        U& get(size_t index) {
-            if (index >= blocks.size()) {
-                throw std::out_of_range("Invalid block index");
-            }
-            return *reinterpret_cast<U*>(blocks[index]->data);
-        }
-
-        /**
-         * @brief Retrieves a reference to a dense block array
-         * 
-         * Specialized version for accessing dense matrix blocks
-         * 
-         * @param index Block index to access
-         * @return Reference to the dense block array
-         * @throws std::out_of_range if index is invalid
-         */
-        std::array<T, BLOCK_SIZE * BLOCK_SIZE>& get(size_t index) {
-            if (index >= blocks.size()) {
-                throw std::out_of_range("Invalid block index");
-            }
-            return *reinterpret_cast<std::array<T, BLOCK_SIZE * BLOCK_SIZE>*>(blocks[index]->data);
-        }
-
-        /**
-         * @brief Retrieves a const reference to a dense block array
-         * 
-         * Const version for read-only access to dense matrix blocks
-         * 
-         * @param index Block index to access
-         * @return Const reference to the dense block array
-         * @throws std::out_of_range if index is invalid
-         */
-        const std::array<T, BLOCK_SIZE * BLOCK_SIZE>& get(size_t index) const {
-            if (index >= blocks.size()) {
-                throw std::out_of_range("Invalid block index");
-            }
-            return *reinterpret_cast<const std::array<T, BLOCK_SIZE * BLOCK_SIZE>*>(blocks[index]->data);
-        }
-    };
-
-    /**
-     * @brief Main storage components for the matrix
-     */
-    MemoryPool densePool;                    ///< Pool for dense block storage
-    std::vector<std::unordered_map<std::pair<int, int>, T, PairHash>> sparseStorage;  ///< Storage for sparse blocks
-    std::unordered_map<std::pair<int, int>, BlockMetadata, PairHash> blockIndex;      ///< Metadata for all blocks
-    size_t numRows;                          ///< Total number of matrix rows
-    size_t numCols;                          ///< Total number of matrix columns
+    MemoryPool memoryPool;
+    std::vector<std::unordered_map<std::pair<CoordType, CoordType>, T, PairHash>> sparseStorage;  ///< Storage for sparse blocks
 
     /**
      * @brief Cache structure for fast element lookup
      */
     struct MatrixEntry {
-        T value;              ///< Stored value
-        bool isDense;         ///< Whether the value is in dense storage
-        size_t blockIndex;    ///< Index of the containing block
+        T value;
+        bool isDense;
+        void* blockPtr;
+        
+        MatrixEntry(T v = T{}, bool dense = false, void* ptr = nullptr)
+            : value(v), isDense(dense), blockPtr(ptr) {}
     };
-    std::unordered_map<std::pair<int, int>, MatrixEntry, PairHash> fastLookup;  ///< Cache for recent accesses
+    std::unordered_map<std::pair<CoordType, CoordType>, MatrixEntry, PairHash> fastLookup;  ///< Cache for recent accesses
 
     /**
      * @brief Helper method to convert global coordinates to block coordinates
@@ -309,8 +299,9 @@ private:
      * @param col Global column index
      * @return Pair of block coordinates
      */
-    std::pair<int, int> getBlockCoords(size_t row, size_t col) const {
-        return {row / BLOCK_SIZE, col / BLOCK_SIZE};
+    std::pair<CoordType, CoordType> getBlockCoords(size_t row, size_t col) const {
+        return {static_cast<CoordType>(row / blockSize), 
+                static_cast<CoordType>(col / blockSize)};
     }
 
     /**
@@ -321,7 +312,7 @@ private:
      * @return Local offset within the block
      */
     size_t getLocalOffset(size_t row, size_t col) const {
-        return (row % BLOCK_SIZE) * BLOCK_SIZE + (col % BLOCK_SIZE);
+        return (row % blockSize) * blockSize + (col % blockSize);
     }
 
     /**
@@ -332,7 +323,7 @@ private:
      * @param metadata Reference to block metadata to update
      */
     void updateDensity(BlockMetadata& metadata) {
-        metadata.density = static_cast<double>(metadata.nonZeroCount) / (BLOCK_SIZE * BLOCK_SIZE);
+        metadata.density = static_cast<double>(metadata.nonZeroCount) / (blockSize * blockSize);
         
         // Update block type based on density thresholds
         if (metadata.density < ULTRA_SPARSE_THRESHOLD) {
@@ -371,9 +362,6 @@ private:
         }
         if (a >= BlockType::DENSE && b >= BlockType::DENSE) {
             return MultiplyStrategy::DENSE_DENSE;
-        }
-        if (a <= BlockType::SPARSE && b <= BlockType::SPARSE) {
-            return MultiplyStrategy::SPARSE_SPARSE;
         }
         return MultiplyStrategy::HYBRID;
     }
@@ -421,40 +409,35 @@ private:
      * @param blockIdxB Index of second block in dense storage
      * @param result Array to store multiplication result
      */
-    void multiplyDenseSIMD(size_t blockIdxA, size_t blockIdxB, 
-                          std::array<T, BLOCK_SIZE * BLOCK_SIZE>& result) const {
-        const auto& blockA = densePool.get(blockIdxA);
-        const auto& blockB = densePool.get(blockIdxB);
-
-        if (CPUFeatures::hasAVX() && CPUFeatures::hasFMA()) {
-            // AVX path with FMA optimization
-            #pragma omp parallel for collapse(2)
-            for (size_t i = 0; i < BLOCK_SIZE; i++) {
-                for (size_t j = 0; j < BLOCK_SIZE; j += 4) {
-                    __m256d sum = _mm256_setzero_pd();
-                    
-                    for (size_t k = 0; k < BLOCK_SIZE; k++) {
-                        __m256d a = _mm256_set1_pd(blockA[i * BLOCK_SIZE + k]);
-                        __m256d b = _mm256_load_pd(&blockB[k * BLOCK_SIZE + j]);
-                        sum = _mm256_fmadd_pd(a, b, sum);
-                    }
-                    
-                    _mm256_store_pd(&result[i * BLOCK_SIZE + j], sum);
-                }
-            }
-        } else {
-            // Fallback path without SIMD
-            #pragma omp parallel for collapse(2)
-            for (size_t i = 0; i < BLOCK_SIZE; i++) {
-                for (size_t j = 0; j < BLOCK_SIZE; j++) {
-                    T sum = 0;
-                    for (size_t k = 0; k < BLOCK_SIZE; k++) {
-                        sum += blockA[i * BLOCK_SIZE + k] * blockB[k * BLOCK_SIZE + j];
-                    }
-                    result[i * BLOCK_SIZE + j] = sum;
+    void multiplyDenseSIMD(const void* blockPtrA, const void* blockPtrB, T* result) const {
+        const auto* blockA = static_cast<const T*>(blockPtrA);
+        const auto* blockB = static_cast<const T*>(blockPtrB);
+        
+        #ifdef __AVX2__
+        // AVX2 optimized path
+        for (size_t i = 0; i < blockSize; i++) {
+            for (size_t k = 0; k < blockSize; k++) {
+                __m256d a = _mm256_set1_pd(blockA[i * blockSize + k]);
+                for (size_t j = 0; j < blockSize; j += 4) {
+                    __m256d b = _mm256_loadu_pd(&blockB[k * blockSize + j]);
+                    __m256d c = _mm256_loadu_pd(&result[i * blockSize + j]);
+                    __m256d prod = _mm256_mul_pd(a, b);
+                    c = _mm256_add_pd(c, prod);
+                    _mm256_storeu_pd(&result[i * blockSize + j], c);
                 }
             }
         }
+        #else
+        // Fallback scalar path
+        for (size_t i = 0; i < blockSize; i++) {
+            for (size_t k = 0; k < blockSize; k++) {
+                const T aik = blockA[i * blockSize + k];
+                for (size_t j = 0; j < blockSize; j++) {
+                    result[i * blockSize + j] += aik * blockB[k * blockSize + j];
+                }
+            }
+        }
+        #endif
     }
 
     /**
@@ -469,28 +452,33 @@ private:
      * @param coordB Coordinates of second block
      * @param result Matrix to store multiplication result
      */
-    void multiplySparse(const std::pair<int, int>& coordA, 
-                       const std::pair<int, int>& coordB,
+    void multiplySparse(const std::pair<CoordType, CoordType>& coordA,
+                       const std::pair<CoordType, CoordType>& coordB,
                        hash_matrix<T>& result) const {
-        const auto& sparseA = sparseStorage[blockIndex.at(coordA).dataIndex];
-        const auto& sparseB = sparseStorage[blockIndex.at(coordB).dataIndex];
+        auto blockA = blockIndex.find(coordA);
+        auto blockB = blockIndex.find(coordB);
 
-        // Convert to sorted vectors for better cache performance
-        std::vector<std::tuple<size_t, size_t, T>> sortedA, sortedB;
-        for (const auto& [pos, val] : sparseA) {
-            sortedA.emplace_back(pos.first, pos.second, val);
+        if (blockA == blockIndex.end() || blockB == blockIndex.end()) {
+            return;  // One of the blocks is empty, no contribution to result
         }
-        for (const auto& [pos, val] : sparseB) {
-            sortedB.emplace_back(pos.first, pos.second, val);
-        }
-        std::sort(sortedA.begin(), sortedA.end());
-        std::sort(sortedB.begin(), sortedB.end());
 
-        // Multiply sorted sparse blocks
-        for (const auto& [rowA, colA, valA] : sortedA) {
-            for (const auto& [rowB, colB, valB] : sortedB) {
-                if (colA == rowB) {
-                    result.insert(rowA, colB, valA * valB);
+        // Get the sparse blocks
+        const auto* sparseBlockA = static_cast<const SparseBlock*>(blockA->second.dataPtr);
+        const auto* sparseBlockB = static_cast<const SparseBlock*>(blockB->second.dataPtr);
+
+        // For each non-zero element in block A
+        for (const auto& [posA, valA] : *sparseBlockA) {
+            // For each non-zero element in block B
+            for (const auto& [posB, valB] : *sparseBlockB) {
+                if (posA.second == posB.first) {  // If inner dimensions match
+                    // Calculate global positions
+                    size_t globalRow = coordA.first * blockSize + posA.first;
+                    size_t globalCol = coordB.second * blockSize + posB.second;
+                    
+                    // Add the product to the result
+                    // Note: Using += instead of = to accumulate products
+                    result.insert(globalRow, globalCol, 
+                                result.get(globalRow, globalCol) + valA * valB);
                 }
             }
         }
@@ -505,7 +493,9 @@ private:
      * @brief Aligned storage structure for dense blocks
      */
     struct alignas(CACHE_LINE_SIZE) DenseBlock {
-        std::array<T, BLOCK_SIZE * BLOCK_SIZE> data;
+        std::vector<T> data;
+        
+        explicit DenseBlock(size_t size) : data(size) {}
     };
 
     /**
@@ -513,112 +503,10 @@ private:
      * 
      * @param blockCoord Coordinates of block to prefetch
      */
-    void prefetchBlock(const std::pair<int, int>& blockCoord) {
+    void prefetchBlock(const std::pair<CoordType, CoordType>& blockCoord) {
         auto it = blockIndex.find(blockCoord);
         if (it != blockIndex.end()) {
-            __builtin_prefetch(&densePool.get(it->second.dataIndex));
-        }
-    }
-
-    /**
-     * @brief Hybrid multiplication implementation for mixed sparse-dense blocks
-     * 
-     * Implements an optimized multiplication strategy for cases where one block
-     * is dense and the other is sparse. Uses SIMD operations when available
-     * and includes cache optimization techniques.
-     * 
-     * @param coordA Coordinates of first block
-     * @param coordB Coordinates of second block
-     * @param result Matrix to store multiplication result
-     */
-    void multiplyHybrid(const std::pair<int, int>& coordA, 
-                        const std::pair<int, int>& coordB,
-                        hash_matrix<T>& result) const {
-        const auto& metadataA = blockIndex.at(coordA);
-        const auto& metadataB = blockIndex.at(coordB);
-        
-        if (metadataA.type >= BlockType::DENSE) {
-            // Dense-Sparse multiplication path
-            const auto& denseBlock = densePool.get(metadataA.dataIndex);
-            const auto& sparseBlock = sparseStorage[metadataB.dataIndex];
-            
-            if (CPUFeatures::hasAVX()) {
-                // Optimized AVX path
-                std::vector<std::pair<size_t, T>> sortedSparse;
-                for (const auto& [pos, val] : sparseBlock) {
-                    sortedSparse.emplace_back(pos.second, val);
-                }
-                std::sort(sortedSparse.begin(), sortedSparse.end());
-                
-                // Use SIMD for dense rows
-                alignas(32) T temp[BLOCK_SIZE];
-                for (size_t i = 0; i < BLOCK_SIZE; i++) {
-                    __m256d sum = _mm256_setzero_pd();
-                    size_t sparseIdx = 0;
-                    
-                    while (sparseIdx < sortedSparse.size()) {
-                        size_t k = sortedSparse[sparseIdx].first;
-                        T val = sortedSparse[sparseIdx].second;
-                        
-                        __m256d sparse = _mm256_set1_pd(val);
-                        __m256d dense = _mm256_load_pd(&denseBlock[i * BLOCK_SIZE + k]);
-                        sum = _mm256_fmadd_pd(sparse, dense, sum);
-                        
-                        sparseIdx++;
-                    }
-                    
-                    _mm256_store_pd(temp, sum);
-                    T finalSum = temp[0] + temp[1] + temp[2] + temp[3];
-                    if (finalSum != 0) {
-                        result.insert(coordA.first * BLOCK_SIZE + i, 
-                                    coordB.second * BLOCK_SIZE, 
-                                    finalSum);
-                    }
-                }
-            } else {
-                // Scalar fallback path
-                for (const auto& [pos, val] : sparseBlock) {
-                    for (size_t i = 0; i < BLOCK_SIZE; i++) {
-                        T product = denseBlock[i * BLOCK_SIZE + pos.first] * val;
-                        if (product != 0) {
-                            result.insert(coordA.first * BLOCK_SIZE + i,
-                                       coordB.second * BLOCK_SIZE + pos.second,
-                                       product);
-                        }
-                    }
-                }
-            }
-        } else {
-            // Sparse-Dense multiplication path
-            const auto& sparseBlock = sparseStorage[metadataA.dataIndex];
-            const auto& denseBlock = densePool.get(metadataB.dataIndex);
-            
-            // Convert sparse block to sorted format for better cache performance
-            std::vector<std::tuple<size_t, size_t, T>> sortedSparse;
-            for (const auto& [pos, val] : sparseBlock) {
-                sortedSparse.emplace_back(pos.first, pos.second, val);
-            }
-            std::sort(sortedSparse.begin(), sortedSparse.end());
-            
-            // Use SIMD for dense columns
-            alignas(32) T temp[BLOCK_SIZE];
-            for (const auto& [rowA, colA, valA] : sortedSparse) {
-                __m256d sparse_val = _mm256_set1_pd(valA);
-                
-                for (size_t j = 0; j < BLOCK_SIZE; j += 4) {
-                    __m256d dense = _mm256_load_pd(&denseBlock[colA * BLOCK_SIZE + j]);
-                    __m256d prod = _mm256_mul_pd(sparse_val, dense);
-                    _mm256_store_pd(temp, prod);
-                    
-                    for (size_t k = 0; k < 4; k++) {
-                        if (temp[k] != 0) {
-                            result.insert(coordA.first * BLOCK_SIZE + rowA,
-                                        coordB.second * BLOCK_SIZE + j + k,
-                                        temp[k]);
-                        }
-                    }
-                }
-            }
+            __builtin_prefetch(&memoryPool.get(it->second.dataIndex));
         }
     }
 
@@ -629,7 +517,7 @@ private:
      * This helps reduce fragmentation and improve computation efficiency.
      */
     void coalesceBlocks() {
-        std::vector<std::pair<int, int>> candidates;
+        std::vector<std::pair<CoordType, CoordType>> candidates;
         
         // Find adjacent blocks that could be merged
         for (const auto& [coord, metadata] : blockIndex) {
@@ -641,7 +529,7 @@ private:
                     nextBlock->second.type == BlockType::SPARSE) {
                     double combinedDensity = 
                         (metadata.nonZeroCount + nextBlock->second.nonZeroCount) / 
-                        (2.0 * BLOCK_SIZE * BLOCK_SIZE);
+                        (2.0 * blockSize * blockSize);
                     
                     if (combinedDensity >= SPARSE_THRESHOLD) {
                         candidates.push_back(coord);
@@ -666,35 +554,34 @@ private:
      * @param coord1 Coordinates of first block
      * @param coord2 Coordinates of second block
      */
-    void mergeBlocks(const std::pair<int, int>& coord1, 
-                     const std::pair<int, int>& coord2) {
+    void mergeBlocks(const std::pair<CoordType, CoordType>& coord1, 
+                     const std::pair<CoordType, CoordType>& coord2) {
         auto& block1 = blockIndex[coord1];
         auto& block2 = blockIndex[coord2];
         
-        // Allocate new block with template keyword
-        size_t newBlockIdx = densePool.template allocate<std::array<T, BLOCK_SIZE * BLOCK_SIZE>>(1);
-        auto& newBlock = densePool.get(newBlockIdx);
+        // Allocate new block
+        T* newBlock = new T[blockSize * blockSize]();
         
         // Copy data from original blocks
-        const auto& block1Data = densePool.get(blockIndex[coord1].dataIndex);
-        const auto& block2Data = densePool.get(blockIndex[coord2].dataIndex);
+        const auto& block1Data = memoryPool.get(blockIndex[coord1].dataIndex);
+        const auto& block2Data = memoryPool.get(blockIndex[coord2].dataIndex);
         
         // Copy data from sparse blocks to dense block
         for (const auto& [pos, val] : sparseStorage[block1.dataIndex]) {
-            size_t localRow = pos.first % BLOCK_SIZE;
-            size_t localCol = pos.second % BLOCK_SIZE;
-            newBlock[localRow * BLOCK_SIZE + localCol] = val;
+            size_t localRow = pos.first % blockSize;
+            size_t localCol = pos.second % blockSize;
+            newBlock[localRow * blockSize + localCol] = val;
         }
         
         for (const auto& [pos, val] : sparseStorage[block2.dataIndex]) {
-            size_t localRow = pos.first % BLOCK_SIZE;
-            size_t localCol = pos.second % BLOCK_SIZE;
-            newBlock[localRow * BLOCK_SIZE + localCol] = val;
+            size_t localRow = pos.first % blockSize;
+            size_t localCol = pos.second % blockSize;
+            newBlock[localRow * blockSize + localCol] = val;
         }
         
         // Update metadata
         block1.type = BlockType::DENSE;
-        block1.dataIndex = newBlockIdx;
+        block1.dataIndex = memoryPool.getLastIndex();
         blockIndex.erase(coord2);
         
         // Update density information
@@ -715,7 +602,7 @@ private:
     void batchInsertImpl(const std::vector<std::tuple<size_t, size_t, T>>& values) {
         // Create a mapping of block coordinates to their pending insertions
         // This groups operations by block to minimize storage transitions
-        std::unordered_map<std::pair<int, int>, 
+        std::unordered_map<std::pair<CoordType, CoordType>, 
                           std::vector<std::tuple<size_t, size_t, T>>, 
                           PairHash> blockGroups;
 
@@ -723,8 +610,8 @@ private:
         // Convert global coordinates to block-local coordinates during grouping
         for (const auto& [row, col, val] : values) {
             auto blockCoord = getBlockCoords(row, col);
-            blockGroups[blockCoord].emplace_back(row % BLOCK_SIZE, 
-                                               col % BLOCK_SIZE, 
+            blockGroups[blockCoord].emplace_back(row % blockSize, 
+                                               col % blockSize, 
                                                val);
         }
 
@@ -738,45 +625,20 @@ private:
                                               });
 
             // Calculate density to choose between sparse and dense storage
-            double density = static_cast<double>(nonZeroCount) / (BLOCK_SIZE * BLOCK_SIZE);
+            double density = static_cast<double>(nonZeroCount) / (blockSize * blockSize);
             auto& metadata = blockIndex[blockCoord];
             
-            if (density >= SPARSE_THRESHOLD) {
-                // Dense storage is more efficient for this block
-                size_t blockIdx;
-                
-                // Allocate new dense block or reuse existing one
-                if (metadata.type < BlockType::DENSE) {
-                    blockIdx = densePool.template allocate<std::array<T, BLOCK_SIZE * BLOCK_SIZE>>(1);
-                    metadata.dataIndex = blockIdx;
+            // Properly allocate and track memory
+            if (!metadata.dataPtr) {
+                if (density >= SPARSE_THRESHOLD) {
+                    metadata.dataPtr = memoryPool.template allocate<T>(blockSize * blockSize);
+                    metadata.type = BlockType::DENSE;
                 } else {
-                    blockIdx = metadata.dataIndex;
-                }
-                
-                // Initialize dense block and populate with new values
-                auto& block = densePool.get(blockIdx);
-                std::fill(block.begin(), block.end(), T{});  // Clear existing values
-                
-                for (const auto& [i, j, val] : blockValues) {
-                    block[i * BLOCK_SIZE + j] = val;
-                }
-                
-                metadata.type = BlockType::DENSE;
-            } else {
-                // Sparse storage is more efficient for this block
-                
-                // Convert from dense if necessary
-                if (metadata.type >= BlockType::DENSE) {
-                    sparseStorage[metadata.dataIndex].clear();
+                    metadata.dataPtr = memoryPool.template allocate<SparseBlock>(1);
                     metadata.type = BlockType::SPARSE;
+                    new (metadata.dataPtr) SparseBlock();
                 }
-                
-                // Insert non-zero values into sparse storage
-                for (const auto& [i, j, val] : blockValues) {
-                    if (val != 0) {
-                        sparseStorage[metadata.dataIndex][{i, j}] = val;
-                    }
-                }
+                metadata.dataIndex = memoryPool.getLastIndex();
             }
             
             // Update block metadata
@@ -786,74 +648,336 @@ private:
             // Update fast lookup cache for all affected positions
             // This ensures O(1) access time for recently inserted values
             for (const auto& [i, j, val] : blockValues) {
-                size_t globalRow = blockCoord.first * BLOCK_SIZE + i;
-                size_t globalCol = blockCoord.second * BLOCK_SIZE + j;
-                fastLookup[{globalRow, globalCol}] = {
+                size_t globalRow = blockCoord.first * blockSize + i;
+                size_t globalCol = blockCoord.second * blockSize + j;
+                fastLookup[{globalRow, globalCol}] = MatrixEntry(
                     val, 
                     metadata.type >= BlockType::DENSE, 
                     metadata.dataIndex
-                };
+                );
+            }
+        }
+    }
+
+    BlockMetadata& getBlockMetadata(CoordType row, CoordType col) {
+        std::pair<CoordType, CoordType> blockCoord = {
+            row / blockSize, 
+            col / blockSize
+        };
+        
+        auto& metadata = blockIndex[blockCoord];
+        if (!metadata.dataPtr) {
+            if (metadata.type == BlockType::DENSE) {
+                metadata.dataPtr = memoryPool.template allocate<T>(blockSize * blockSize);
+                std::fill_n(static_cast<T*>(metadata.dataPtr), blockSize * blockSize, T{});
+            } else {
+                metadata.dataPtr = memoryPool.template allocate<SparseBlock>(1);
+                new (metadata.dataPtr) SparseBlock();
+            }
+        }
+        return metadata;
+    }
+
+    const BlockMetadata& getBlockMetadata(CoordType row, CoordType col) const {
+        std::pair<CoordType, CoordType> blockCoord = {
+            row / blockSize, 
+            col / blockSize
+        };
+        
+        auto it = blockIndex.find(blockCoord);
+        if (it == blockIndex.end()) {
+            static const BlockMetadata emptyBlock;
+            return emptyBlock;
+        }
+        return it->second;
+    }
+
+    // Add type conversion helper for coordinate types
+    template<typename FromType>
+    static std::vector<std::tuple<CoordType, CoordType, T>> convertData(
+            const std::vector<std::tuple<FromType, FromType, T>>& data) {
+        std::vector<std::tuple<CoordType, CoordType, T>> result;
+        result.reserve(data.size());
+        for (const auto& [i, j, val] : data) {
+            result.emplace_back(static_cast<CoordType>(i), 
+                              static_cast<CoordType>(j), 
+                              val);
+        }
+        return result;
+    }
+
+    void checkBounds(CoordType row, CoordType col) const {
+        if (row >= numRows || col >= numCols) {
+            throw std::out_of_range("Matrix index out of bounds");
+        }
+    }
+
+    void multiplyBlock(const std::pair<CoordType, CoordType>& coordA,
+                     const std::pair<CoordType, CoordType>& coordB,
+                     hash_matrix<T>& result) const {
+        const auto blockA = blockIndex.find(coordA);
+        const auto blockB = blockIndex.find(coordB);
+        
+        if (blockA == blockIndex.end() || blockB == blockIndex.end()) {
+            return;
+        }
+
+        const auto& metadataA = blockA->second;
+        const auto& metadataB = blockB->second;
+
+        // Choose multiplication strategy based on block types
+        if (metadataA.type == BlockType::DENSE && metadataB.type == BlockType::DENSE) {
+            multiplyDenseDense(metadataA, metadataB, coordA, coordB, result);
+        } else if (metadataA.type == BlockType::SPARSE && metadataB.type == BlockType::SPARSE) {
+            multiplySparse(coordA, coordB, result);
+        } else {
+            multiplyHybrid(coordA, coordB, result);
+        }
+    }
+
+    void multiplyDenseDense(const BlockMetadata& blockA,
+                           const BlockMetadata& blockB,
+                           const std::pair<CoordType, CoordType>& coordA,
+                           const std::pair<CoordType, CoordType>& coordB,
+                           hash_matrix<T>& result) const {
+        const T* dataA = static_cast<const T*>(blockA.dataPtr);
+        const T* dataB = static_cast<const T*>(blockB.dataPtr);
+        std::vector<T> accumulator(blockSize * blockSize, T{});
+
+        for (size_t i = 0; i < blockSize; i++) {
+            for (size_t k = 0; k < blockSize; k++) {
+                const T aik = dataA[i * blockSize + k];
+                for (size_t j = 0; j < blockSize; j++) {
+                    accumulator[i * blockSize + j] += aik * dataB[k * blockSize + j];
+                }
+            }
+        }
+
+        // Add accumulated results to result matrix
+        for (size_t i = 0; i < blockSize; i++) {
+            for (size_t j = 0; j < blockSize; j++) {
+                size_t globalRow = coordA.first * blockSize + i;
+                size_t globalCol = coordB.second * blockSize + j;
+                if (accumulator[i * blockSize + j] != T{}) {
+                    result.insert(globalRow, globalCol, 
+                                result.get(globalRow, globalCol) + 
+                                accumulator[i * blockSize + j]);
+                }
+            }
+        }
+    }
+
+    /**
+     * @brief Hybrid multiplication implementation for mixed sparse-dense blocks
+     * 
+     * Implements an optimized multiplication strategy for cases where one block
+     * is dense and the other is sparse. Uses SIMD operations when available
+     * and includes cache optimization techniques.
+     * 
+     * @param coordA Coordinates of first block
+     * @param coordB Coordinates of second block
+     * @param result Matrix to store multiplication result
+     */
+    void multiplyHybrid(const std::pair<CoordType, CoordType>& coordA,
+                        const std::pair<CoordType, CoordType>& coordB,
+                        hash_matrix<T>& result) const {
+        auto blockA = blockIndex.find(coordA);
+        auto blockB = blockIndex.find(coordB);
+        
+        if (blockA == blockIndex.end() || blockB == blockIndex.end()) {
+            return;
+        }
+
+        const auto& metadataA = blockA->second;
+        const auto& metadataB = blockB->second;
+
+        if (metadataA.type >= BlockType::DENSE) {
+            // Dense-Sparse multiplication
+            const T* denseBlock = static_cast<const T*>(metadataA.dataPtr);
+            const auto* sparseBlock = static_cast<const SparseBlock*>(metadataB.dataPtr);
+
+            for (const auto& [posB, valB] : *sparseBlock) {
+                for (size_t i = 0; i < blockSize; i++) {
+                    T valA = denseBlock[i * blockSize + posB.first];
+                    if (valA != T{}) {
+                        size_t globalRow = coordA.first * blockSize + i;
+                        size_t globalCol = coordB.second * blockSize + posB.second;
+                        
+                        if (globalRow < result.numRows && globalCol < result.numCols) {
+                            T product = valA * valB;
+                            T current = result.get(globalRow, globalCol);
+                            result.insert(globalRow, globalCol, current + product);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Sparse-Dense multiplication
+            const auto* sparseBlock = static_cast<const SparseBlock*>(metadataA.dataPtr);
+            const T* denseBlock = static_cast<const T*>(metadataB.dataPtr);
+
+            for (const auto& [posA, valA] : *sparseBlock) {
+                for (size_t j = 0; j < blockSize; j++) {
+                    T valB = denseBlock[posA.second * blockSize + j];
+                    if (valB != T{}) {
+                        size_t globalRow = coordA.first * blockSize + posA.first;
+                        size_t globalCol = coordB.second * blockSize + j;
+                        
+                        if (globalRow < result.numRows && globalCol < result.numCols) {
+                            T product = valA * valB;
+                            T current = result.get(globalRow, globalCol);
+                            result.insert(globalRow, globalCol, current + product);
+                        }
+                    }
+                }
             }
         }
     }
 
 public:
-    void batchInsert(const std::vector<std::tuple<size_t, size_t, T>>& values) {
-        // Group insertions by block
-        std::unordered_map<std::pair<int, int>, 
-                          std::vector<std::tuple<size_t, size_t, T>>, 
-                          PairHash> blockGroups;
-
-        for (const auto& [row, col, val] : values) {
-            auto blockCoord = getBlockCoords(row, col);
-            blockGroups[blockCoord].emplace_back(row % BLOCK_SIZE, 
-                                               col % BLOCK_SIZE, 
-                                               val);
+    /**
+     * @brief Multiplies this matrix with another matrix
+     * 
+     * @param other The matrix to multiply with
+     * @return Result of multiplication
+     * @throws std::invalid_argument if dimensions don't match
+     */
+    hash_matrix<T> multiply(const hash_matrix<T>& other) const {
+        if (numCols != other.numRows) {
+            throw std::invalid_argument("Matrix dimensions must match for multiplication");
         }
 
-        // Process each block
-        #pragma omp parallel for
-        for (const auto& [blockCoord, blockValues] : blockGroups) {
-            size_t nonZeroCount = std::count_if(blockValues.begin(), 
-                                              blockValues.end(),
-                                              [](const auto& t) { 
-                                                  return std::get<2>(t) != 0; 
-                                              });
+        hash_matrix<T> result(numRows, other.numCols);
+        
+        std::cout << "\n=== Starting Matrix Multiplication ===\n";
+        std::cout << "Matrix 1: " << numRows << "x" << numCols << "\n";
+        std::cout << "Matrix 2: " << other.numRows << "x" << other.numCols << "\n";
 
-            double density = static_cast<double>(nonZeroCount) / (BLOCK_SIZE * BLOCK_SIZE);
-            auto& metadata = blockIndex[blockCoord];
-            
-            if (density >= SPARSE_THRESHOLD) {
-                // Use dense storage
-                size_t blockIdx = metadata.dataIndex;
-                if (metadata.type < BlockType::DENSE) {
-                    blockIdx = densePool.template allocate<std::array<T, BLOCK_SIZE * BLOCK_SIZE>>(1);
-                    metadata.dataIndex = blockIdx;
-                }
-                
-                auto& block = densePool.get(blockIdx);
-                for (const auto& [i, j, val] : blockValues) {
-                    block[i * BLOCK_SIZE + j] = val;
-                }
-                
-                metadata.type = BlockType::DENSE;
-            } else {
-                // Use sparse storage
-                for (const auto& [i, j, val] : blockValues) {
-                    if (val != 0) {
-                        sparseStorage[metadata.dataIndex][{blockCoord.first * BLOCK_SIZE + i, 
-                                                         blockCoord.second * BLOCK_SIZE + j}] = val;
+        // Log input matrices
+        std::cout << "\nMatrix 1 values:\n";
+        for (size_t i = 0; i < numRows; i++) {
+            for (size_t j = 0; j < numCols; j++) {
+                std::cout << get(i, j) << " ";
+            }
+            std::cout << "\n";
+        }
+
+        std::cout << "\nMatrix 2 values:\n";
+        for (size_t i = 0; i < other.numRows; i++) {
+            for (size_t j = 0; j < other.numCols; j++) {
+                std::cout << other.get(i, j) << " ";
+            }
+            std::cout << "\n";
+        }
+
+        for (size_t i = 0; i < (numRows + blockSize - 1) / blockSize; i++) {
+            for (size_t j = 0; j < (other.numCols + blockSize - 1) / blockSize; j++) {
+                for (size_t k = 0; k < (numCols + blockSize - 1) / blockSize; k++) {
+                    std::pair<CoordType, CoordType> coordA{static_cast<CoordType>(i), 
+                                                          static_cast<CoordType>(k)};
+                    std::pair<CoordType, CoordType> coordB{static_cast<CoordType>(k), 
+                                                          static_cast<CoordType>(j)};
+
+                    std::cout << "\nProcessing block multiplication:";
+                    std::cout << "\nBlock A: (" << coordA.first << "," << coordA.second << ")";
+                    std::cout << "\nBlock B: (" << coordB.first << "," << coordB.second << ")\n";
+
+                    auto blockA = blockIndex.find(coordA);
+                    auto blockB = other.blockIndex.find(coordB);
+
+                    if (blockA != blockIndex.end() && blockB != other.blockIndex.end()) {
+                        if (blockA->second.type >= BlockType::DENSE && 
+                            blockB->second.type >= BlockType::DENSE) {
+                            std::cout << "Using dense-dense multiplication\n";
+                            multiplyDenseDense(blockA->second, blockB->second, coordA, coordB, result);
+                        } else if (blockA->second.type < BlockType::DENSE && 
+                                 blockB->second.type < BlockType::DENSE) {
+                            std::cout << "Using sparse-sparse multiplication\n";
+                            multiplySparse(coordA, coordB, result);
+                        } else {
+                            std::cout << "Using hybrid multiplication\n";
+                            multiplyHybrid(coordA, coordB, result);
+                        }
                     }
                 }
             }
-            
-            metadata.nonZeroCount = nonZeroCount;
-            updateDensity(metadata);
+        }
+
+        std::cout << "\nFinal result matrix:\n";
+        for (size_t i = 0; i < result.numRows; i++) {
+            for (size_t j = 0; j < result.numCols; j++) {
+                std::cout << result.get(i, j) << " ";
+            }
+            std::cout << "\n";
+        }
+
+        return result;
+    }
+
+    /**
+     * @brief Multiplication operator
+     * 
+     * @param other The matrix to multiply with
+     * @return Result of multiplication
+     */
+    hash_matrix<T> operator*(const hash_matrix<T>& other) const {
+        return multiply(other);
+    }
+
+    // Use the converter in public methods
+    template<typename InputCoordType>
+    void batchInsert(const std::vector<std::tuple<InputCoordType, InputCoordType, T>>& data) {
+        for (const auto& [i, j, val] : data) {
+            insert(CoordConverter::convert(i), CoordConverter::convert(j), val);
         }
     }
 
-    void remove(size_t row, size_t col) {
-        insert(row, col, T{});
+    // Specialization for matching types
+    void batchInsert(const std::vector<std::tuple<CoordType, CoordType, T>>& data) {
+        for (const auto& [i, j, val] : data) {
+            insert(i, j, val);
+        }
+    }
+
+    // Helper method for batch conversion
+    template<typename FromType>
+    static std::vector<std::tuple<CoordType, CoordType, T>> convertBatch(
+            const std::vector<std::tuple<FromType, FromType, T>>& data) {
+        std::vector<std::tuple<CoordType, CoordType, T>> result;
+        result.reserve(data.size());
+        
+        for (const auto& [i, j, val] : data) {
+            result.emplace_back(
+                CoordConverter::convert(i),
+                CoordConverter::convert(j),
+                val
+            );
+        }
+        
+        return result;
+    }
+
+    void remove(CoordType row, CoordType col) {
+        checkBounds(row, col);
+        
+        auto blockCoord = getBlockCoords(row, col);
+        auto localCoord = getLocalCoords(row, col);
+        
+        auto it = blockIndex.find(blockCoord);
+        if (it == blockIndex.end()) return;
+        
+        auto& block = it->second;
+        if (block.type == BlockType::SPARSE) {
+            auto* sparseBlock = static_cast<SparseBlock*>(block.dataPtr);
+            sparseBlock->erase({localCoord.first, localCoord.second});
+            if (sparseBlock->empty()) {
+                delete sparseBlock;
+                blockIndex.erase(it);
+            }
+        } else if (block.type == BlockType::DENSE) {
+            auto* denseData = static_cast<T*>(block.dataPtr);
+            denseData[localCoord.first * blockSize + localCoord.second] = T{};
+        }
     }
 
     /**
@@ -864,12 +988,11 @@ public:
      * @param rows Number of rows in the matrix
      * @param cols Number of columns in the matrix
      */
-    hash_matrix(size_t rows, size_t cols) 
-        : numRows(rows)
-        , numCols(cols) {
-        size_t numBlocks = ((rows + BLOCK_SIZE - 1) / BLOCK_SIZE) * 
-                          ((cols + BLOCK_SIZE - 1) / BLOCK_SIZE);
-        sparseStorage.resize(numBlocks);
+    hash_matrix(size_t rows, size_t cols, size_t blockSize = 8) 
+        : numRows(rows), numCols(cols), blockSize(blockSize) {
+        if (blockSize == 0) {
+            throw std::invalid_argument("Block size must be greater than 0");
+        }
     }
 
     /**
@@ -894,7 +1017,7 @@ public:
         size_t localRow;
         size_t localCol;
         size_t currentDenseBlock;
-        std::vector<std::pair<int, int>> denseBlocks;
+        std::vector<std::pair<CoordType, CoordType>> denseBlocks;
         value_type current_value;
         std::pair<size_t, size_t> currentPos;
 
@@ -927,7 +1050,7 @@ public:
             while (currentDenseBlock < denseBlocks.size()) {
                 const auto& blockCoord = denseBlocks[currentDenseBlock];
                 const auto& metadata = matrix->blockIndex.at(blockCoord);
-                const auto& block = matrix->densePool.get(metadata.dataIndex);
+                const auto& block = matrix->memoryPool.get(metadata.dataIndex);
                 
                 // Prefetch next block for better cache utilization
                 if (currentDenseBlock + 1 < denseBlocks.size()) {
@@ -935,10 +1058,10 @@ public:
                 }
 
                 // SIMD scan for non-zero elements
-                for (size_t i = localRow; i < BLOCK_SIZE; i++) {
+                for (size_t i = localRow; i < blockSize; i++) {
                     __m256d zero = _mm256_setzero_pd();
-                    for (size_t j = localCol; j < BLOCK_SIZE; j += 4) {
-                        __m256d val = _mm256_load_pd(&block[i * BLOCK_SIZE + j]);
+                    for (size_t j = localCol; j < blockSize; j += 4) {
+                        __m256d val = _mm256_load_pd(&block[i * blockSize + j]);
                         __m256d mask = _mm256_cmp_pd(val, zero, _CMP_NEQ_OQ);
                         unsigned int bits = _mm256_movemask_pd(mask);
                         if (bits) {
@@ -985,10 +1108,10 @@ public:
          */
         Iterator& operator++() {
             localCol++;
-            if (localCol >= BLOCK_SIZE) {
+            if (localCol >= blockSize) {
                 localCol = 0;
                 localRow++;
-                if (localRow >= BLOCK_SIZE) {
+                if (localRow >= blockSize) {
                     localRow = 0;
                     findNextNonZero();
                 }
@@ -1002,8 +1125,8 @@ public:
          * @return Tuple containing (row, column, value) of current element
          */
         reference operator*() const {
-            size_t globalRow = currentBlockRow * BLOCK_SIZE + localRow;
-            size_t globalCol = currentBlockCol * BLOCK_SIZE + localCol;
+            size_t globalRow = currentBlockRow * blockSize + localRow;
+            size_t globalCol = currentBlockCol * blockSize + localCol;
             return current_value = std::make_tuple(globalRow, globalCol, 
                 matrix->get(globalRow, globalCol));
         }
@@ -1020,9 +1143,9 @@ public:
          * @param maxCol Maximum column index
          */
         Iterator(const hash_matrix* m, size_t maxRow, size_t maxCol) 
-            : matrix(m), currentBlockRow(maxRow / BLOCK_SIZE), 
-              currentBlockCol(maxCol / BLOCK_SIZE),
-              localRow(maxRow % BLOCK_SIZE), localCol(maxCol % BLOCK_SIZE),
+            : matrix(m), currentBlockRow(maxRow / blockSize), 
+              currentBlockCol(maxCol / blockSize),
+              localRow(maxRow % blockSize), localCol(maxCol % blockSize),
               currentDenseBlock(std::numeric_limits<size_t>::max()) {}
     };
 
@@ -1035,149 +1158,6 @@ public:
      * @brief Returns an iterator to the end of the matrix
      */
     Iterator end() const { return Iterator(this, numRows * numCols, 0); }
-
-    /**
-     * @brief Inserts or updates a value in the matrix
-     * 
-     * Automatically manages storage format transitions and updates metadata.
-     * Uses cache-optimized access patterns and maintains the fast lookup table.
-     * 
-     * @param row Row index of the element
-     * @param col Column index of the element
-     * @param value Value to insert
-     */
-    void insert(size_t row, size_t col, T value) {
-        auto blockCoord = getBlockCoords(row, col);
-        auto& metadata = blockIndex[blockCoord];
-        
-        if (metadata.type == BlockType::DENSE || metadata.type == BlockType::FULL) {
-            // Handle dense storage format
-            size_t offset = getLocalOffset(row, col);
-            auto& block = densePool.get(metadata.dataIndex);
-            bool wasZero = block[offset] == 0;
-            block[offset] = value;
-            
-            // Update non-zero count
-            if (wasZero && value != 0) metadata.nonZeroCount++;
-            else if (!wasZero && value == 0) metadata.nonZeroCount--;
-        } else {
-            // Handle sparse storage format
-            auto& sparseBlock = sparseStorage[metadata.dataIndex];
-            if (value != 0) {
-                auto [it, inserted] = sparseBlock.insert({{row, col}, value});
-                if (inserted) metadata.nonZeroCount++;
-            } else {
-                if (sparseBlock.erase({row, col}) > 0) metadata.nonZeroCount--;
-            }
-        }
-
-        // Update metadata and cache
-        updateDensity(metadata);
-        fastLookup[{row, col}] = {value, metadata.type >= BlockType::DENSE, metadata.dataIndex};
-    }
-
-    /**
-     * @brief Retrieves a value from the matrix
-     * 
-     * Uses a multi-level caching strategy:
-     * 1. Checks fast lookup cache first
-     * 2. Falls back to block storage lookup if needed
-     * 3. Returns zero for non-existent elements
-     * 
-     * @param row Row index of the element
-     * @param col Column index of the element
-     * @return Value at the specified position
-     */
-    T get(size_t row, size_t col) const {
-        // Try fast lookup first
-        auto it = fastLookup.find({row, col});
-        if (it != fastLookup.end()) {
-            return it->second.value;
-        }
-
-        // Fall back to regular lookup
-        auto blockCoord = getBlockCoords(row, col);
-        auto metaIt = blockIndex.find(blockCoord);
-        if (metaIt == blockIndex.end()) return T{};
-
-        const auto& metadata = metaIt->second;
-        if (metadata.type >= BlockType::DENSE) {
-            size_t offset = getLocalOffset(row, col);
-            return densePool.get(metadata.dataIndex)[offset];
-        } else {
-            const auto& sparseBlock = sparseStorage[metadata.dataIndex];
-            auto it = sparseBlock.find({row, col});
-            return it != sparseBlock.end() ? it->second : T{};
-        }
-    }
-
-    /**
-     * @brief Performs matrix multiplication
-     * 
-     * Implements a highly optimized block-based matrix multiplication that:
-     * 1. Uses different strategies based on block types
-     * 2. Employs SIMD operations for dense blocks
-     * 3. Optimizes sparse block operations
-     * 4. Parallelizes computation using OpenMP
-     * 
-     * @param other Matrix to multiply with
-     * @return Result of multiplication
-     * @throws std::invalid_argument if dimensions don't match
-     */
-    hash_matrix<T> multiply(const hash_matrix<T>& other) const {
-        if (numCols != other.numRows) {
-            throw std::invalid_argument("Matrix dimensions must match for multiplication");
-        }
-
-        hash_matrix<T> result(numRows, other.numCols);
-        
-        #pragma omp parallel for collapse(2)
-        for (size_t i = 0; i < (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE; i++) {
-            for (size_t j = 0; j < (other.numCols + BLOCK_SIZE - 1) / BLOCK_SIZE; j++) {
-                std::array<T, BLOCK_SIZE * BLOCK_SIZE> tempResult{};
-                
-                for (size_t k = 0; k < (numCols + BLOCK_SIZE - 1) / BLOCK_SIZE; k++) {
-                    std::pair<int, int> blockA{i, k}, blockB{k, j};
-                    
-                    auto strategyA = blockIndex.find(blockA);
-                    auto strategyB = other.blockIndex.find(blockB);
-                    
-                    if (strategyA == blockIndex.end() || strategyB == other.blockIndex.end()) {
-                        continue;  // Skip empty blocks
-                    }
-
-                    // Choose optimal multiplication strategy
-                    switch (getOptimalMultiplyStrategy(strategyA->second.type, 
-                                                     strategyB->second.type)) {
-                        case MultiplyStrategy::DENSE_DENSE:
-                            multiplyDenseSIMD(strategyA->second.dataIndex,
-                                            strategyB->second.dataIndex,
-                                            tempResult);
-                            break;
-                        case MultiplyStrategy::SPARSE_SPARSE:
-                        case MultiplyStrategy::ULTRA_SPARSE_SPARSE:
-                            multiplySparse(blockA, blockB, result);
-                            break;
-                        case MultiplyStrategy::HYBRID:
-                            multiplyHybrid(blockA, blockB, result);
-                            break;
-                    }
-                }
-
-                // Insert non-zero results
-                for (size_t bi = 0; bi < BLOCK_SIZE; bi++) {
-                    for (size_t bj = 0; bj < BLOCK_SIZE; bj++) {
-                        T val = tempResult[bi * BLOCK_SIZE + bj];
-                        if (val != 0) {
-                            result.insert(i * BLOCK_SIZE + bi, j * BLOCK_SIZE + bj, val);
-                        }
-                    }
-                }
-            }
-        }
-
-        return result;
-    }
 
     /**
      * @brief Optimized matrix addition
@@ -1198,13 +1178,13 @@ public:
         }
 
         hash_matrix<T> result(numRows, numCols);
-        std::vector<std::pair<int, int>> processedBlocks;
+        std::vector<std::pair<CoordType, CoordType>> processedBlocks;
 
         // Process dense blocks first using SIMD
         #pragma omp parallel for collapse(2)
-        for (size_t i = 0; i < (numRows + BLOCK_SIZE - 1) / BLOCK_SIZE; i++) {
-            for (size_t j = 0; j < (numCols + BLOCK_SIZE - 1) / BLOCK_SIZE; j++) {
-                std::pair<int, int> blockCoord{i, j};
+        for (size_t i = 0; i < (numRows + blockSize - 1) / blockSize; i++) {
+            for (size_t j = 0; j < (numCols + blockSize - 1) / blockSize; j++) {
+                std::pair<CoordType, CoordType> blockCoord{i, j};
                 auto blockA = blockIndex.find(blockCoord);
                 auto blockB = other.blockIndex.find(blockCoord);
 
@@ -1212,17 +1192,17 @@ public:
                     blockA->second.type >= BlockType::DENSE && 
                     blockB->second.type >= BlockType::DENSE) {
                     
-                    const auto& dataA = densePool.get(blockA->second.dataIndex);
-                    const auto& dataB = other.densePool.get(blockB->second.dataIndex);
+                    const auto* dataA = static_cast<const T*>(blockA->second.dataPtr);
+                    const auto* dataB = static_cast<const T*>(blockB->second.dataPtr);
                     
                     #pragma omp simd
-                    for (size_t k = 0; k < BLOCK_SIZE * BLOCK_SIZE; k++) {
+                    for (size_t k = 0; k < blockSize * blockSize; k++) {
                         T sum = dataA[k] + dataB[k];
                         if (sum != 0) {
-                            size_t localRow = k / BLOCK_SIZE;
-                            size_t localCol = k % BLOCK_SIZE;
-                            result.insert(i * BLOCK_SIZE + localRow, 
-                                        j * BLOCK_SIZE + localCol, 
+                            size_t localRow = k / blockSize;
+                            size_t localCol = k % blockSize;
+                            result.insert(i * blockSize + localRow, 
+                                        j * blockSize + localCol, 
                                         sum);
                         }
                     }
@@ -1241,10 +1221,10 @@ public:
             }
 
             // Handle sparse addition
-            for (size_t i = 0; i < BLOCK_SIZE; i++) {
-                for (size_t j = 0; j < BLOCK_SIZE; j++) {
-                    size_t globalRow = coord.first * BLOCK_SIZE + i;
-                    size_t globalCol = coord.second * BLOCK_SIZE + j;
+            for (size_t i = 0; i < blockSize; i++) {
+                for (size_t j = 0; j < blockSize; j++) {
+                    size_t globalRow = coord.first * blockSize + i;
+                    size_t globalCol = coord.second * blockSize + j;
                     
                     if (globalRow >= numRows || globalCol >= numCols) continue;
                     
@@ -1257,6 +1237,38 @@ public:
         }
 
         return result;
+    }
+
+    // Add proper copy constructor
+    hash_matrix(const hash_matrix& other)
+        : numRows(other.numRows)
+        , numCols(other.numCols)
+        , blockSize(other.blockSize)
+        , memoryPool(other.memoryPool)
+        , blockIndex(other.blockIndex)
+        , fastLookup(other.fastLookup) {}
+
+    // Add move constructor
+    hash_matrix(hash_matrix&& other) noexcept = default;
+
+    // Add proper assignment operators
+    hash_matrix& operator=(const hash_matrix& other) {
+        if (this != &other) {
+            numRows = other.numRows;
+            numCols = other.numCols;
+            blockSize = other.blockSize;
+            memoryPool = other.memoryPool;
+            blockIndex = other.blockIndex;
+            fastLookup = other.fastLookup;
+        }
+        return *this;
+    }
+
+    hash_matrix& operator=(hash_matrix&& other) noexcept = default;
+
+    // Add method to get current block size
+    size_t getBlockSize() const {
+        return blockSize;
     }
 };
 
